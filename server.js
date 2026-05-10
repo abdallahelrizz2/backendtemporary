@@ -1230,7 +1230,7 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // POST /api/auth/register (admin only - but allow first user to be admin)
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', authMiddleware, requireRole('admin'), async (req, res) => {
   try {
     const { username, email, password, role = 'accountant', full_name } = req.body;
 
@@ -1240,31 +1240,6 @@ app.post('/api/auth/register', async (req, res) => {
 
     if (password.length < 6) {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
-    }
-
-    // Check if this is the first user (allow them to be admin)
-    const [existingUsers] = await db.query('SELECT COUNT(*) as count FROM users');
-    const isFirstUser = existingUsers[0].count === 0;
-    const finalRole = isFirstUser ? 'admin' : role;
-
-    // If not first user, restrict creating privileged roles
-    const privilegedRoles = ['admin', 'ceo'];
-    if (!isFirstUser && privilegedRoles.includes(role)) {
-      // Only admin can create admin; admin or ceo can create ceo
-      try {
-        const token = req.headers.authorization?.split(' ')[1];
-        if (token) {
-          const decoded = jwt.verify(token, process.env.JWT_SECRET);
-          const [adminCheck] = await db.query('SELECT role FROM users WHERE user_id = ?', [decoded.userId]);
-          if (adminCheck.length === 0 || !hasMinRole(adminCheck[0].role, role === 'admin' ? 'admin' : 'ceo')) {
-            return res.status(403).json({ error: `Only ${role === 'admin' ? 'admins' : 'admins or CEOs'} can create ${role} accounts` });
-          }
-        } else {
-          return res.status(403).json({ error: `Only admins can create ${role} accounts` });
-        }
-      } catch {
-        return res.status(403).json({ error: `Only admins can create ${role} accounts` });
-      }
     }
 
     // Check if username or email already exists
@@ -1282,7 +1257,7 @@ app.post('/api/auth/register', async (req, res) => {
     // Create user
     const [result] = await db.query(
       'INSERT INTO users (username, email, password_hash, role, full_name) VALUES (?, ?, ?, ?, ?)',
-      [username, email, passwordHash, finalRole, full_name || null]
+      [username, email, passwordHash, role, full_name || null]
     );
 
     const [newUser] = await db.query(
@@ -8527,19 +8502,20 @@ app.get('/api/chat-stream', async (req, res) => {
     return res.status(400).json({ error: 'session_id query parameter required' });
   }
 
-  // Authenticate via query param token (EventSource doesn't support headers)
+  // Authenticate via query param token (EventSource can't send headers)
   const token = req.query.token;
-  if (token) {
-    try {
-      const decoded = jwt.verify(token, JWT_SECRET);
-      const [users] = await db.query('SELECT user_id FROM users WHERE user_id = ?', [decoded.userId]);
-      if (users.length > 0) {
-        req.user = users[0];
-      }
-    } catch (e) {
-      // Token invalid — continue without user (backward compatible)
-      console.warn('[SSE] Invalid token provided:', e.message);
+  if (!token) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const [users] = await db.query('SELECT user_id FROM users WHERE user_id = ?', [decoded.userId]);
+    if (users.length === 0) {
+      return res.status(401).json({ error: 'User not found' });
     }
+    req.user = users[0];
+  } catch (e) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
   }
 
   res.writeHead(200, {
@@ -8820,6 +8796,17 @@ app.put('/api/chat/branch/switch', authMiddleware, async (req, res) => {
 //   { session_id, type: 'assistant', text: '...', done: true }  → final answer, saved to DB
 // type defaults to 'assistant' for backward compatibility.
 app.post('/api/chat-callback', async (req, res) => {
+  const callbackSecret = process.env.CHAT_CALLBACK_SECRET;
+  if (!callbackSecret) {
+    console.error('[Callback] CHAT_CALLBACK_SECRET env var not set — rejecting all callback requests');
+    return res.status(503).json({ error: 'Callback endpoint not configured' });
+  }
+  const providedSecret = req.headers['x-callback-secret'];
+  if (!providedSecret || providedSecret !== callbackSecret) {
+    console.warn('[Callback] Rejected request with invalid or missing X-Callback-Secret');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
   console.log('[Callback] Received body:', JSON.stringify(req.body, null, 2));
 
   const { session_id, output, message, text: bodyText, response, content, type: bodyType } = req.body;

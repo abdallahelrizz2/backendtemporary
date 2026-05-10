@@ -13,6 +13,8 @@
 SET @seed_tag = CONVERT('TEST_SEED_RISETEXCO_WORKBENCH_2026_04' USING utf8mb4) COLLATE utf8mb4_unicode_ci;
 SET @yards_per_meter = 1.0936132983;
 SET time_zone = '+00:00';
+SET @old_sql_safe_updates := @@sql_safe_updates;
+SET sql_safe_updates = 0;
 
 START TRANSACTION;
 
@@ -31,9 +33,20 @@ FROM users
 WHERE username LIKE 'wb\_%'
    OR email LIKE '%@risetexco.test';
 
-DELETE cr
-FROM cancellation_requests cr
-JOIN wb_seed_group_ids g ON g.transaction_group_id = cr.transaction_group_id;
+SET @has_cancellation_requests := (
+  SELECT COUNT(*)
+  FROM information_schema.tables
+  WHERE table_schema = DATABASE()
+    AND table_name = 'cancellation_requests'
+);
+SET @sql := IF(
+  @has_cancellation_requests > 0,
+  'DELETE cr FROM cancellation_requests cr JOIN wb_seed_group_ids g ON g.transaction_group_id = cr.transaction_group_id',
+  'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 DELETE l
 FROM logs l
@@ -45,15 +58,20 @@ DELETE tg
 FROM transaction_groups tg
 JOIN wb_seed_group_ids g ON g.transaction_group_id = tg.transaction_group_id;
 
-DELETE dr
-FROM deletion_requests dr
-WHERE (dr.request_type = 'delete_fabric' AND dr.target_id IN (SELECT fabric_id FROM fabrics WHERE main_code LIKE 'WB-%'))
-   OR (dr.request_type = 'delete_color' AND dr.target_id IN (
-        SELECT c.color_id
-        FROM colors c
-        JOIN fabrics f ON f.fabric_id = c.fabric_id
-        WHERE f.main_code LIKE 'WB-%'
-      ));
+SET @has_deletion_requests := (
+  SELECT COUNT(*)
+  FROM information_schema.tables
+  WHERE table_schema = DATABASE()
+    AND table_name = 'deletion_requests'
+);
+SET @sql := IF(
+  @has_deletion_requests > 0,
+  'DELETE dr FROM deletion_requests dr WHERE (dr.request_type = ''delete_fabric'' AND dr.target_id IN (SELECT fabric_id FROM fabrics WHERE main_code LIKE ''WB-%'')) OR (dr.request_type = ''delete_color'' AND dr.target_id IN (SELECT c.color_id FROM colors c JOIN fabrics f ON f.fabric_id = c.fabric_id WHERE f.main_code LIKE ''WB-%''))',
+  'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 DELETE cl
 FROM color_lots cl
@@ -77,32 +95,85 @@ DELETE FROM salespersons
 WHERE code LIKE 'WB-%'
    OR name LIKE 'WB TEST - %';
 
-DELETE cm
-FROM chat_messages cm
-JOIN chat_conversations cc ON cc.conversation_id = cm.conversation_id
-JOIN wb_seed_user_ids u ON u.user_id = cc.user_id;
+SET @has_chat_messages := (
+  SELECT COUNT(*)
+  FROM information_schema.tables
+  WHERE table_schema = DATABASE()
+    AND table_name = 'chat_messages'
+);
+SET @sql := IF(
+  @has_chat_messages > 0,
+  'DELETE cm FROM chat_messages cm JOIN chat_conversations cc ON cc.conversation_id = cm.conversation_id JOIN wb_seed_user_ids u ON u.user_id = cc.user_id',
+  'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-DELETE cc
-FROM chat_conversations cc
-JOIN wb_seed_user_ids u ON u.user_id = cc.user_id;
+SET @has_chat_conversations := (
+  SELECT COUNT(*)
+  FROM information_schema.tables
+  WHERE table_schema = DATABASE()
+    AND table_name = 'chat_conversations'
+);
+SET @sql := IF(
+  @has_chat_conversations > 0,
+  'DELETE cc FROM chat_conversations cc JOIN wb_seed_user_ids u ON u.user_id = cc.user_id',
+  'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-DELETE td
-FROM transaction_drafts td
-JOIN wb_seed_user_ids u ON u.user_id = td.user_id;
+SET @has_transaction_drafts := (
+  SELECT COUNT(*)
+  FROM information_schema.tables
+  WHERE table_schema = DATABASE()
+    AND table_name = 'transaction_drafts'
+);
+SET @sql := IF(
+  @has_transaction_drafts > 0,
+  'DELETE td FROM transaction_drafts td JOIN wb_seed_user_ids u ON u.user_id = td.user_id',
+  'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-DELETE al
-FROM audit_logs al
-JOIN wb_seed_user_ids u ON u.user_id = al.user_id;
+SET @has_audit_logs := (
+  SELECT COUNT(*)
+  FROM information_schema.tables
+  WHERE table_schema = DATABASE()
+    AND table_name = 'audit_logs'
+);
+SET @sql := IF(
+  @has_audit_logs > 0,
+  'DELETE al FROM audit_logs al JOIN wb_seed_user_ids u ON u.user_id = al.user_id',
+  'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 DELETE u
 FROM users u
 JOIN wb_seed_user_ids seed_u ON seed_u.user_id = u.user_id;
 
 -- Users. Password hash is for: Test123!
+SET @users_role_type := (
+  SELECT COLUMN_TYPE
+  FROM information_schema.columns
+  WHERE table_schema = DATABASE()
+    AND table_name = 'users'
+    AND column_name = 'role'
+  LIMIT 1
+);
+SET @ceo_role := IF(@users_role_type LIKE '%ceo%', 'ceo', 'manager');
+
 INSERT INTO users (username, email, password_hash, role, full_name)
 VALUES
   ('wb_admin', 'wb_admin@risetexco.test', '$2b$10$uhEbBmjZAl9vgI9unsn51OnC6ZnBGLx8wmAj.Px6lhreneJhuCMGO', 'admin', 'Workbench Test Admin'),
-  ('wb_ceo', 'wb_ceo@risetexco.test', '$2b$10$uhEbBmjZAl9vgI9unsn51OnC6ZnBGLx8wmAj.Px6lhreneJhuCMGO', 'ceo', 'Workbench Test CEO'),
+  ('wb_ceo', 'wb_ceo@risetexco.test', '$2b$10$uhEbBmjZAl9vgI9unsn51OnC6ZnBGLx8wmAj.Px6lhreneJhuCMGO', @ceo_role, 'Workbench Test CEO'),
   ('wb_manager', 'wb_manager@risetexco.test', '$2b$10$uhEbBmjZAl9vgI9unsn51OnC6ZnBGLx8wmAj.Px6lhreneJhuCMGO', 'manager', 'Workbench Test Manager'),
   ('wb_accountant', 'wb_accountant@risetexco.test', '$2b$10$uhEbBmjZAl9vgI9unsn51OnC6ZnBGLx8wmAj.Px6lhreneJhuCMGO', 'accountant', 'Workbench Test Accountant');
 
@@ -351,6 +422,7 @@ VALUES
   ('return', @fab_linen, @color_linen_white, @cust_cedar, @sp_layla, @manager_id, 'WB TEST Belgian Linen', 'Natural White', 'WB TEST - Cedar Boutique Beirut', 25.00, ROUND(25.00 * @yards_per_meter, 2), NULL, 1, '150gsm', 'WB-BL-01', 'WB-ROLL-004', CONCAT(@seed_tag, '; return linen white'), @dt, UNIX_TIMESTAMP(@dt) * 1000, 'Asia/Beirut', 'WB-G-0014', @log_linen_return_source);
 
 COMMIT;
+SET sql_safe_updates = @old_sql_safe_updates;
 
 -- Summary and expected accuracy checks.
 SELECT 'Workbench seed complete' AS status, @seed_tag AS seed_tag;
