@@ -1,8 +1,10 @@
-import dotenv from 'dotenv';
+﻿import dotenv from 'dotenv';
 dotenv.config();
 
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -38,26 +40,21 @@ console.log("PORT:", PORT);
 console.log("NODE_ENV:", process.env.NODE_ENV || "development");
 console.log("=========================");
 
-app.get("/api/__prove", (req, res) => {
-  res.send("PROVE ROUTE");
-});
-
-
-
 // Middleware
 // CORS: restrict to the production frontend domain, but allow specific tools like n8n
 const allowedOrigins = [
   'https://depotmanagersystemrisetexcofrontend.pages.dev',
   'https://operations.risetexco.com',
+  'https://n8n-production-6ea1.up.railway.app',
   'http://localhost:5173',
   'http://localhost:5174'
 ];
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests/n8n)
+    // Allow requests with no origin (server-to-server calls like n8n webhooks)
     if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1 || origin.includes('n8n')) {
+    if (allowedOrigins.indexOf(origin) !== -1) {
       return callback(null, true);
     }
     return callback(new Error('The CORS policy for this site does not allow access from the specified Origin.'), false);
@@ -68,7 +65,17 @@ app.use(cors({
 }));
 
 app.options('*', cors());
+app.use(helmet());
 app.use(express.json());
+
+// Rate limiters
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts, please try again later' },
+});
 
 // Request logging middleware
 app.use((req, res, next) => {
@@ -1155,7 +1162,7 @@ function sendDuplicateCustomerName(res, existingCustomer, requestedName) {
 // ============================================
 
 // POST /api/auth/login
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const { username, email, password } = req.body;
 
@@ -1190,7 +1197,7 @@ app.post('/api/auth/login', async (req, res) => {
     const token = jwt.sign(
       { userId: user.user_id, username: user.username, role: user.role },
       JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '1d' }
     );
 
     // Return user info (without password hash) and token
@@ -1220,17 +1227,12 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Generic error - include message in development for debugging
-    const isDevelopment = process.env.NODE_ENV !== 'production';
-    res.status(500).json({
-      error: 'Failed to login',
-      ...(isDevelopment && { detail: error.message, stack: error.stack })
-    });
+    res.status(500).json({ error: 'Failed to login' });
   }
 });
 
 // POST /api/auth/register (admin only - but allow first user to be admin)
-app.post('/api/auth/register', authMiddleware, requireRole('admin'), async (req, res) => {
+app.post('/api/auth/register', authLimiter, authMiddleware, requireRole('admin'), async (req, res) => {
   try {
     const { username, email, password, role = 'accountant', full_name } = req.body;
 
@@ -1899,7 +1901,7 @@ app.get('/api/customers/:id/transaction-groups', authMiddleware, async (req, res
   }
 });
 
-app.post('/api/customers', authMiddleware, async (req, res) => {
+app.post('/api/customers', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
   try {
     const { name, phone, email, notes } = req.body || {};
     const customerName = typeof name === 'string' ? name.trim() : '';
@@ -1937,11 +1939,11 @@ app.post('/api/customers', authMiddleware, async (req, res) => {
       return sendDuplicateCustomerName(res, existingCustomer, requestedName || 'this name');
     }
     console.error('Error creating customer:', error.message, error.code);
-    res.status(500).json({ error: error.message || 'Failed to create customer' });
+    res.status(500).json({ error: 'Failed to create customer' });
   }
 });
 
-app.put('/api/customers/:id', authMiddleware, async (req, res) => {
+app.put('/api/customers/:id', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
   try {
     const { name, phone, email, notes } = req.body || {};
     const updates = {};
@@ -1987,7 +1989,7 @@ app.put('/api/customers/:id', authMiddleware, async (req, res) => {
       return sendDuplicateCustomerName(res, existingCustomer, requestedName || 'this name');
     }
     console.error('Error updating customer:', error.message, error.code);
-    res.status(500).json({ error: error.message || 'Failed to update customer' });
+    res.status(500).json({ error: 'Failed to update customer' });
   }
 });
 
@@ -2002,7 +2004,7 @@ app.get('/api/customers/:id/transaction-count', authMiddleware, async (req, res)
   }
 });
 
-app.delete('/api/customers/:id', authMiddleware, async (req, res) => {
+app.delete('/api/customers/:id', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     await connection.beginTransaction();
@@ -2037,7 +2039,7 @@ app.delete('/api/customers/:id', authMiddleware, async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Error deleting customer:', error.message, error.code);
-    res.status(500).json({ error: error.message || 'Failed to delete customer' });
+    res.status(500).json({ error: 'Failed to delete customer' });
   } finally {
     connection.release();
   }
@@ -2108,7 +2110,7 @@ app.get('/api/fabrics/:fabric_id/transactions', authMiddleware, async (req, res)
 });
 
 // POST create new fabric
-app.post('/api/fabrics', authMiddleware, async (req, res) => {
+app.post('/api/fabrics', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
   try {
     const { fabric_name, main_code, source, design, unit_type } = req.body;
 
@@ -2155,7 +2157,7 @@ app.post('/api/fabrics', authMiddleware, async (req, res) => {
 });
 
 // PUT update single fabric by fabric_id
-app.put('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
+app.put('/api/fabrics/:fabric_id', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
   try {
     const fabricId = parseInt(req.params.fabric_id);
     const { fabric_name, main_code, source, design, unit_type } = req.body;
@@ -2455,7 +2457,7 @@ app.put('/api/fabrics', authMiddleware, requireRole('admin'), async (req, res) =
   } catch (error) {
     console.error('PUT /api/fabrics error:', error.message);
     console.error('Error stack:', error.stack);
-    res.status(500).json({ error: error.message || 'Failed to update fabrics' });
+    res.status(500).json({ error: 'Failed to update fabrics' });
   }
 });
 
@@ -2464,7 +2466,7 @@ app.put('/api/fabrics', authMiddleware, requireRole('admin'), async (req, res) =
 // ============================================
 
 // POST /api/fabrics/:fabric_id/colors - Add color to fabric
-app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
+app.post('/api/fabrics/:fabric_id/colors', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const fabricId = parseInt(req.params.fabric_id);
@@ -2649,7 +2651,7 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Error creating color:', error);
-    res.status(500).json({ error: error.message || 'Failed to create color' });
+    res.status(500).json({ error: 'Failed to create color' });
   } finally {
     connection.release();
   }
@@ -2697,6 +2699,14 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
     // Build dynamic update query
     const updates = [];
     const values = [];
+
+    // Role check: only managers and admins can update color metadata
+    if ((color_name !== undefined || date !== undefined || weight !== undefined ||
+         lot !== undefined || roll_nb !== undefined) &&
+        req.user.role !== 'admin' && req.user.role !== 'manager') {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Only managers and admins can update color details' });
+    }
 
     if (color_name !== undefined) {
       if (!color_name || !color_name.trim()) {
@@ -2797,12 +2807,20 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
     }
 
     if (roll_count !== undefined) {
+      if (req.user.role !== 'admin' && req.user.role !== 'manager') {
+        await connection.rollback();
+        return res.status(403).json({ error: 'Only managers and admins can update roll count' });
+      }
       const rollCountValue = parseInt(roll_count) || 0;
       updates.push('roll_count = ?');
       values.push(rollCountValue);
     }
 
     if (status !== undefined) {
+      if (!['available', 'sold_out'].includes(status)) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'status must be "available" or "sold_out"' });
+      }
       updates.push('status = ?');
       values.push(status);
     }
@@ -2953,7 +2971,7 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Error updating color:', error);
-    res.status(500).json({ error: error.message || 'Failed to update color' });
+    res.status(500).json({ error: 'Failed to update color' });
   } finally {
     connection.release();
   }
@@ -3089,7 +3107,7 @@ async function addMetersToColorHandler(req, res) {
   } catch (error) {
     await connection.rollback();
     console.error('Error adding meters to color:', error);
-    res.status(500).json({ error: error.message || 'Failed to add meters to color' });
+    res.status(500).json({ error: 'Failed to add meters to color' });
   } finally {
     connection.release();
   }
@@ -3139,12 +3157,12 @@ app.get('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
     res.json(formattedLots);
   } catch (error) {
     console.error('Error fetching lots:', error);
-    res.status(500).json({ error: error.message || 'Failed to fetch lots' });
+    res.status(500).json({ error: 'Failed to fetch lots' });
   }
 });
 
 // POST /api/colors/:color_id/lots - Add a lot to a color
-app.post('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
+app.post('/api/colors/:color_id/lots', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const colorId = parseInt(req.params.color_id);
@@ -3239,14 +3257,14 @@ app.post('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Error adding lot:', error);
-    res.status(500).json({ error: error.message || 'Failed to add lot' });
+    res.status(500).json({ error: 'Failed to add lot' });
   } finally {
     connection.release();
   }
 });
 
 // PUT /api/colors/:color_id/lots/:lot_id - Update a lot
-app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) => {
+app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const colorId = parseInt(req.params.color_id);
@@ -3354,14 +3372,14 @@ app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) =
   } catch (error) {
     await connection.rollback();
     console.error('Error updating lot:', error);
-    res.status(500).json({ error: error.message || 'Failed to update lot' });
+    res.status(500).json({ error: 'Failed to update lot' });
   } finally {
     connection.release();
   }
 });
 
 // DELETE /api/colors/:color_id/lots/:lot_id - Delete a lot
-app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) => {
+app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const colorId = parseInt(req.params.color_id);
@@ -3406,7 +3424,7 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
   } catch (error) {
     await connection.rollback();
     console.error('Error deleting lot:', error);
-    res.status(500).json({ error: error.message || 'Failed to delete lot' });
+    res.status(500).json({ error: 'Failed to delete lot' });
   } finally {
     connection.release();
   }
@@ -3484,7 +3502,7 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
   } catch (error) {
     await connection.rollback();
     console.error('Error bulk updating rolls:', error);
-    res.status(500).json({ error: error.message || 'Failed to bulk update rolls' });
+    res.status(500).json({ error: 'Failed to bulk update rolls' });
   } finally {
     connection.release();
   }
@@ -3618,7 +3636,7 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
   } catch (error) {
     await connection.rollback();
     console.error('Error updating roll:', error);
-    res.status(500).json({ error: error.message || 'Failed to update roll' });
+    res.status(500).json({ error: 'Failed to update roll' });
   } finally {
     connection.release();
   }
@@ -3720,7 +3738,7 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
   } catch (error) {
     await connection.rollback();
     console.error('Error trimming roll:', error);
-    res.status(500).json({ error: error.message || 'Failed to trim roll' });
+    res.status(500).json({ error: 'Failed to trim roll' });
   } finally {
     connection.release();
   }
@@ -3794,7 +3812,7 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
   } catch (error) {
     await connection.rollback();
     console.error('Error selling roll:', error);
-    res.status(500).json({ error: error.message || 'Failed to sell roll' });
+    res.status(500).json({ error: 'Failed to sell roll' });
   } finally {
     connection.release();
   }
@@ -4038,7 +4056,7 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
   } catch (error) {
     await connection.rollback();
     console.error('Error returning roll:', error);
-    res.status(500).json({ error: error.message || 'Failed to return roll' });
+    res.status(500).json({ error: 'Failed to return roll' });
   } finally {
     connection.release();
   }
@@ -4368,7 +4386,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
   } catch (error) {
     await connection.rollback();
     console.error('Error selling color:', error);
-    res.status(500).json({ error: error.message || 'Failed to sell color' });
+    res.status(500).json({ error: 'Failed to sell color' });
   } finally {
     connection.release();
   }
@@ -4701,7 +4719,7 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Error in sell-batch:', error);
-    res.status(500).json({ error: error.message || 'Failed to process batch transaction' });
+    res.status(500).json({ error: 'Failed to process batch transaction' });
   } finally {
     connection.release();
   }
@@ -4907,7 +4925,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
   } catch (error) {
     await connection.rollback();
     console.error('Error returning color:', error);
-    res.status(500).json({ error: error.message || 'Failed to return color' });
+    res.status(500).json({ error: 'Failed to return color' });
   } finally {
     connection.release();
   }
@@ -5159,7 +5177,7 @@ app.post('/api/transactions/return/partial', authMiddleware, async (req, res) =>
   } catch (err) {
     if (connection.rollback) await connection.rollback();
     console.error('Error in partial return:', err);
-    res.status(500).json({ error: err.message || 'Partial return failed' });
+    res.status(500).json({ error: 'Partial return failed' });
   } finally {
     connection.release();
   }
@@ -5498,7 +5516,7 @@ app.post('/api/transactions/:groupId/return', authMiddleware, async (req, res) =
   } catch (err) {
     if (connection.rollback) await connection.rollback();
     console.error('Error in /api/transactions/:groupId/return:', err);
-    res.status(500).json({ error: err.message || 'Return transaction failed' });
+    res.status(500).json({ error: 'Return transaction failed' });
   } finally {
     connection.release();
   }
@@ -5969,10 +5987,7 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
   } catch (error) {
     await connection.rollback();
     console.error('Error updating transaction type:', error);
-    res.status(500).json({
-      error: 'Failed to update transaction type',
-      message: error.message || (error.sqlMessage || String(error))
-    });
+    res.status(500).json({ error: 'Failed to update transaction type' });
   } finally {
     connection.release();
   }
@@ -5980,7 +5995,7 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
 
 // PUT /api/transaction-groups/:transaction_group_id/permit-number - Update permit number with duplicate validation
 // Allow both admin and limited users to update permit numbers
-app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddleware, async (req, res) => {
+app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const transactionGroupId = req.params.transaction_group_id;
@@ -6245,7 +6260,7 @@ app.delete('/api/transaction-groups/:transaction_group_id', authMiddleware, requ
   }
 });
 
-app.post('/api/logs', authMiddleware, async (req, res) => {
+app.post('/api/logs', authMiddleware, requireMinRole('manager'), async (req, res) => {
   try {
     const entry = req.body || {};
     const now = getLebanonTimestamp();
@@ -6379,7 +6394,7 @@ app.post('/api/logs', authMiddleware, async (req, res) => {
     // Provide more helpful error message
     const errorMessage = error.code === 'ER_NO_REFERENCED_ROW_2'
       ? 'Invalid roll ID or fabric ID - record does not exist'
-      : error.message || 'Failed to create log';
+      : 'Failed to create log';
     res.status(500).json({ error: errorMessage });
   }
 });
@@ -6687,10 +6702,7 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
     });
   } catch (error) {
     console.error('Error updating log:', error);
-    res.status(500).json({
-      error: 'Failed to update log',
-      message: error.message || (error.sqlMessage || String(error))
-    });
+    res.status(500).json({ error: 'Failed to update log' });
   }
 });
 
@@ -6897,7 +6909,7 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
   } catch (error) {
     await connection.rollback();
     console.error('Error canceling log:', error);
-    res.status(500).json({ error: 'Failed to cancel log: ' + error.message });
+    res.status(500).json({ error: 'Failed to cancel log' });
   } finally {
     connection.release();
   }
@@ -7475,7 +7487,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
   } catch (err) {
     if (connection.rollback) await connection.rollback();
     console.error('Error in PUT /api/transactions/:groupId/edit:', err);
-    res.status(500).json({ error: err.message || 'Edit transaction failed' });
+    res.status(500).json({ error: 'Edit transaction failed' });
   } finally {
     connection.release();
   }
@@ -7692,7 +7704,7 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
   } catch (error) {
     await connection.rollback();
     console.error('Error canceling transaction:', error);
-    res.status(500).json({ error: 'Failed to cancel transaction: ' + error.message });
+    res.status(500).json({ error: 'Failed to cancel transaction' });
   } finally {
     connection.release();
   }
@@ -7730,7 +7742,7 @@ app.get('/api/salespersons', authMiddleware, async (req, res) => {
 });
 
 // POST /api/salespersons - Create new salesperson
-app.post('/api/salespersons', authMiddleware, async (req, res) => {
+app.post('/api/salespersons', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
   try {
     const { name, code, email, phone, active = true } = req.body;
 
@@ -7774,7 +7786,7 @@ app.post('/api/salespersons', authMiddleware, async (req, res) => {
 });
 
 // PUT /api/salespersons/:id - Update salesperson
-app.put('/api/salespersons/:id', authMiddleware, async (req, res) => {
+app.put('/api/salespersons/:id', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
   try {
     const salespersonId = parseInt(req.params.id);
     const { name, code, email, phone, active } = req.body;
@@ -8217,21 +8229,17 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
     console.error('Error stack:', error.stack);
     console.error('Error code:', error.code);
     // Provide more detailed error information
-    let errorMessage = error.message || 'Failed to fetch audit logs';
+    let errorMessage = 'Failed to fetch audit logs';
 
     if (error.code === 'ER_NO_SUCH_TABLE' || error.message?.includes("doesn't exist")) {
       errorMessage = 'Audit logs table does not exist. Please run the migration: backend/migrate-audit-logs.sql';
     } else if (error.code === 'ER_BAD_FIELD_ERROR') {
-      errorMessage = `Database column error: ${error.message}. The audit_logs table structure may be incorrect.`;
+      errorMessage = 'Audit logs table structure is incorrect. Please check your database migration.';
     } else if (error.code === 'ER_PARSE_ERROR') {
-      errorMessage = `SQL syntax error: ${error.message}`;
+      errorMessage = 'Internal query error. Please contact the administrator.';
     }
 
-    res.status(500).json({
-      error: errorMessage,
-      code: error.code,
-      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
+    res.status(500).json({ error: errorMessage });
   }
 });
 
@@ -8324,22 +8332,6 @@ app.get('/api/audit-logs/statistics', authMiddleware, requireRole('admin'), asyn
   } catch (error) {
     console.error('Error fetching audit statistics:', error);
     res.status(500).json({ error: 'Failed to fetch audit statistics' });
-  }
-});
-
-///TEST
-
-app.get("/api/db-health", async (req, res) => {
-  try {
-    const conn = await pool.getConnection();
-    await conn.ping();
-    conn.release();
-    res.json({ db: "connected" });
-  } catch (err) {
-    res.status(500).json({
-      db: "disconnected",
-      error: err.message
-    });
   }
 });
 
@@ -8579,7 +8571,7 @@ app.post('/api/chat-message', authMiddleware, async (req, res) => {
     console.log(`[Chat] n8n acknowledged with status: ${resp.status}`);
   }).catch(err => {
     console.error(`[Chat] Error forwarding to n8n:`, err.message);
-    const errMsg = `Failed to reach the assistant: ${err.message}`;
+    const errMsg = 'Failed to reach the assistant. Please try again.';
     saveMessage(session_id, 'error', errMsg, new Date().toISOString());
     pushToSSE(session_id, { type: 'error', text: errMsg, timestamp: new Date().toISOString() });
   });
@@ -8667,7 +8659,7 @@ app.post('/api/chat-message/edit', authMiddleware, async (req, res) => {
       console.log(`[Chat Branch] n8n acknowledged with status: ${resp.status}`);
     }).catch(err => {
       console.error(`[Chat Branch] Error forwarding to n8n:`, err.message);
-      const errMsg = `Failed to reach the assistant: ${err.message}`;
+      const errMsg = 'Failed to reach the assistant. Please try again.';
       // Save error with branching info
       db.query(
         `INSERT INTO chat_messages (conversation_id, role, text, timestamp, parent_message_id, branch_index, is_active_branch)
