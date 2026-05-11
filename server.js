@@ -619,6 +619,28 @@ const buildFabricColorAggregatedStructure = async () => {
     // Ensure lots is always an array (defensive check)
     const safeLots = Array.isArray(lots) ? lots : [];
 
+    // Fetch total sold per fabric from logs (sell+trim − return for lengths; sell−return for rolls)
+    const [soldTotals] = await db.query(`
+      SELECT
+        fabric_id,
+        COALESCE(SUM(CASE WHEN type IN ('sell','trim') THEN amount_yards  ELSE 0 END), 0)
+          - COALESCE(SUM(CASE WHEN type = 'return'    THEN amount_yards  ELSE 0 END), 0) AS total_sold_yards,
+        COALESCE(SUM(CASE WHEN type IN ('sell','trim') THEN amount_meters ELSE 0 END), 0)
+          - COALESCE(SUM(CASE WHEN type = 'return'    THEN amount_meters ELSE 0 END), 0) AS total_sold_meters,
+        COALESCE(SUM(CASE WHEN type = 'sell'          THEN roll_count    ELSE 0 END), 0)
+          - COALESCE(SUM(CASE WHEN type = 'return'    THEN roll_count    ELSE 0 END), 0) AS total_sold_rolls
+      FROM logs
+      GROUP BY fabric_id
+    `);
+    const soldByFabric = {};
+    (Array.isArray(soldTotals) ? soldTotals : []).forEach(r => {
+      soldByFabric[r.fabric_id] = {
+        total_sold_yards:  Math.round((parseFloat(r.total_sold_yards)  || 0) * 100) / 100,
+        total_sold_meters: Math.round((parseFloat(r.total_sold_meters) || 0) * 100) / 100,
+        total_sold_rolls:  parseInt(r.total_sold_rolls) || 0,
+      };
+    });
+
     // Group lots by color_id
     const lotsByColor = {};
     safeLots.forEach(lot => {
@@ -697,6 +719,9 @@ const buildFabricColorAggregatedStructure = async () => {
       created_by_full_name: fabric.created_by_full_name,
       updated_by_username: fabric.updated_by_username,
       updated_by_full_name: fabric.updated_by_full_name,
+      total_sold_yards:  soldByFabric[fabric.fabric_id]?.total_sold_yards  ?? 0,
+      total_sold_meters: soldByFabric[fabric.fabric_id]?.total_sold_meters ?? 0,
+      total_sold_rolls:  soldByFabric[fabric.fabric_id]?.total_sold_rolls  ?? 0,
       colors: colorsByFabric[fabric.fabric_id] || []
     }));
   } catch (error) {
