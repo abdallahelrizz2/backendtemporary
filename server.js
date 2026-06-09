@@ -989,6 +989,71 @@ async function generatePermitNumber(connection, transactionType, sourceType = nu
   }
 }
 
+const PERMIT_NUMBER_PATTERN = /^[AB]-\d+$/;
+
+function normalizePermitNumber(permitNumber) {
+  if (!permitNumber || typeof permitNumber !== 'string') return null;
+  return permitNumber.replace(/[{}]/g, '').trim().toUpperCase();
+}
+
+async function validatePermitNumberForTransactionGroup(connection, permitNumber, transactionType, transactionGroupId = null) {
+  const cleanedPermit = normalizePermitNumber(permitNumber);
+
+  if (!cleanedPermit) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'Permit number is required and must be a string' }
+    };
+  }
+
+  if (!PERMIT_NUMBER_PATTERN.test(cleanedPermit)) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: 'Permit number must be in format "A-{number}" or "B-{number}" (e.g., "A-5" or "B-10")',
+        received: permitNumber
+      }
+    };
+  }
+
+  const permitType = cleanedPermit.charAt(0).toUpperCase();
+  if (transactionType !== 'return' && permitType !== transactionType) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: 'Permit number prefix must match transaction type',
+        message: `Permit number starts with "${permitType}" but transaction type is "${transactionType}". Please change the transaction type first.`
+      }
+    };
+  }
+
+  const params = [cleanedPermit, transactionType];
+  let sql = 'SELECT transaction_group_id, permit_number FROM transaction_groups WHERE permit_number = ? AND transaction_type = ?';
+  if (transactionGroupId) {
+    sql += ' AND transaction_group_id != ?';
+    params.push(transactionGroupId);
+  }
+  sql += ' FOR UPDATE';
+
+  const [existing] = await connection.query(sql, params);
+  if (existing.length > 0) {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: 'Duplicate permit number',
+        message: `Another transaction already has permit number ${cleanedPermit}`,
+        conflictingTransaction: existing[0].transaction_group_id
+      }
+    };
+  }
+
+  return { ok: true, permitNumber: cleanedPermit };
+}
+
 // Helper to ensure customer exists in database
 // Called within a database transaction, expects a connection
 async function ensureCustomerExists(connection, customerId, customerName, userId) {
@@ -1053,7 +1118,7 @@ async function ensureCustomerExists(connection, customerId, customerName, userId
 // Helper to create or update transaction group
 // Called within a database transaction, expects a connection
 // Creation date rule: if client sends a user-selected date (transactionDate/timestamp), epoch must be provided or we derive it in Asia/Beirut; we never silently use "today".
-// For returns: pass permitNumberOverride (string) to use user-provided permit number instead of auto-generation.
+// Pass permitNumberOverride (string) to use a user-provided permit number instead of auto-generation for a new group.
 async function createOrUpdateTransactionGroup(connection, transactionGroupId, customerId, customerName, notes, amountMeters, transactionType = 'A', epoch = null, transactionDate = null, amountYards = null, userId = null, permitNumberOverride = null, permitSourceType = null) {
   if (!transactionGroupId) return;
 
@@ -4434,6 +4499,7 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
       transaction_type = 'A',
       epoch,
       transaction_date,
+      permit_number,
     } = req.body;
 
     if (!Array.isArray(items) || items.length === 0) {
@@ -4458,8 +4524,24 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
 
     const conductedByUserId = req.user ? req.user.user_id : null;
     const txGroupId = transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const transactionTypeForGroup = ['A', 'B'].includes(transaction_type) ? transaction_type : 'A';
 
     await connection.beginTransaction();
+
+    let customPermitNumber = null;
+    if (permit_number && typeof permit_number === 'string' && permit_number.trim()) {
+      const permitValidation = await validatePermitNumberForTransactionGroup(
+        connection,
+        permit_number,
+        transactionTypeForGroup,
+        txGroupId
+      );
+      if (!permitValidation.ok) {
+        await connection.rollback();
+        return res.status(permitValidation.status).json(permitValidation.body);
+      }
+      customPermitNumber = permitValidation.permitNumber;
+    }
 
     // ── PHASE 1: Validate every item — lock rows, check amounts, collect computed values ──
     // Zero writes happen here. If anything is wrong we abort before touching inventory.
@@ -4693,8 +4775,8 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
 
     await createOrUpdateTransactionGroup(
       connection, txGroupId, customer_id, customer_name, notes,
-      batchTotalMeters, transaction_type, transactionEpoch, transaction_date,
-      batchTotalYards, conductedByUserId
+      batchTotalMeters, transactionTypeForGroup, transactionEpoch, transaction_date,
+      batchTotalYards, conductedByUserId, customPermitNumber
     );
 
     for (const v of validated) {
@@ -5917,15 +5999,17 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
 });
 
 // PUT /api/transaction-groups/:transaction_group_id/type - Update transaction type (permit numbers are manual)
-app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, requireRole('admin'), async (req, res) => {
+app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, requireMinRole('manager'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const transactionGroupId = req.params.transaction_group_id;
     const { transaction_type, epoch } = req.body;
 
     if (!transaction_type || !['A', 'B', 'return'].includes(transaction_type)) {
-      await connection.rollback();
       return res.status(400).json({ error: 'Transaction type must be A, B, or return' });
+    }
+    if (transaction_type === 'return' && req.user?.role !== 'admin') {
+      return res.status(403).json({ error: 'Only admins can change a transaction group to return type' });
     }
 
     await connection.beginTransaction();
@@ -6019,28 +6103,11 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
 });
 
 // PUT /api/transaction-groups/:transaction_group_id/permit-number - Update permit number with duplicate validation
-// Allow both admin and limited users to update permit numbers
-app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
+app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddleware, requireMinRole('manager'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const transactionGroupId = req.params.transaction_group_id;
     const { permit_number } = req.body;
-
-    if (!permit_number || typeof permit_number !== 'string') {
-      return res.status(400).json({ error: 'Permit number is required and must be a string' });
-    }
-
-    // Clean and validate format: should be "A-1" or "B-1" format
-    // Remove any curly braces and convert to uppercase
-    const cleanedPermit = permit_number.replace(/[{}]/g, '').trim().toUpperCase();
-
-    const permitPattern = /^[AB]-\d+$/;
-    if (!permitPattern.test(cleanedPermit)) {
-      return res.status(400).json({
-        error: 'Permit number must be in format "A-{number}" or "B-{number}" (e.g., "A-5" or "B-10")',
-        received: permit_number
-      });
-    }
 
     await connection.beginTransaction();
 
@@ -6060,34 +6127,17 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
     // Get old record for audit
     const oldGroupRecord = { ...currentGroup };
 
-    // Extract transaction type from permit number (A or B)
-    const permitType = cleanedPermit.charAt(0).toUpperCase();
-
-    // Check if permit number already exists within the same transaction_type scope (excluding current transaction).
-    // A-47 sell and A-47 return can coexist because they serve different purposes.
-    const [existing] = await connection.query(
-      'SELECT transaction_group_id, permit_number FROM transaction_groups WHERE permit_number = ? AND transaction_type = ? AND transaction_group_id != ?',
-      [cleanedPermit, currentGroup.transaction_type, transactionGroupId]
+    const permitValidation = await validatePermitNumberForTransactionGroup(
+      connection,
+      permit_number,
+      currentGroup.transaction_type,
+      transactionGroupId
     );
-
-    if (existing.length > 0) {
+    if (!permitValidation.ok) {
       await connection.rollback();
-      return res.status(409).json({
-        error: 'Duplicate permit number',
-        message: `Another transaction already has permit number ${cleanedPermit}`,
-        conflictingTransaction: existing[0].transaction_group_id
-      });
+      return res.status(permitValidation.status).json(permitValidation.body);
     }
-
-    // Validate that permit number prefix matches transaction type.
-    // Returns use A/B prefix matching their source sell, so skip prefix check for returns.
-    if (currentGroup.transaction_type !== 'return' && permitType !== currentGroup.transaction_type) {
-      await connection.rollback();
-      return res.status(400).json({
-        error: 'Permit number prefix must match transaction type',
-        message: `Permit number starts with "${permitType}" but transaction type is "${currentGroup.transaction_type}". Please change the transaction type first.`
-      });
-    }
+    const cleanedPermit = permitValidation.permitNumber;
 
     // Update permit number only (transaction type is managed separately)
     await connection.query(
@@ -6133,12 +6183,12 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
 });
 
 // PUT /api/transaction-groups/:transaction_group_id - Update transaction group attributes (manager/ceo/admin)
-// Accepts: customer_id, customer_name, epoch, notes, transaction_type (type change: manager/ceo/admin only)
+// Accepts: customer_id, customer_name, epoch, notes, transaction_type, permit_number
 app.put('/api/transaction-groups/:transaction_group_id', authMiddleware, requireRole('admin', 'ceo', 'manager'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const transactionGroupId = req.params.transaction_group_id;
-    const { customer_id, customer_name, epoch, notes, transaction_type } = req.body || {};
+    const { customer_id, customer_name, epoch, notes, transaction_type, permit_number } = req.body || {};
 
     // Get current group
     const [groups] = await connection.query(
@@ -6190,6 +6240,21 @@ app.put('/api/transaction-groups/:transaction_group_id', authMiddleware, require
       fields.push('transaction_type = ?');
       values.push(transaction_type);
     }
+    if (permit_number !== undefined) {
+      const targetTransactionType = transaction_type !== undefined ? transaction_type : oldRecord.transaction_type;
+      const permitValidation = await validatePermitNumberForTransactionGroup(
+        connection,
+        permit_number,
+        targetTransactionType,
+        transactionGroupId
+      );
+      if (!permitValidation.ok) {
+        await connection.rollback();
+        return res.status(permitValidation.status).json(permitValidation.body);
+      }
+      fields.push('permit_number = ?');
+      values.push(permitValidation.permitNumber);
+    }
 
     if (fields.length === 0) {
       await connection.rollback();
@@ -6235,9 +6300,19 @@ app.put('/api/transaction-groups/:transaction_group_id', authMiddleware, require
 app.get('/api/transaction-groups/check-permit/:permitNumber', authMiddleware, async (req, res) => {
   try {
     const { permitNumber } = req.params;
+    const cleanedPermit = normalizePermitNumber(permitNumber);
+    const transactionType = typeof req.query.transaction_type === 'string' ? req.query.transaction_type.trim() : '';
+    const params = [cleanedPermit || permitNumber.trim()];
+    let sql = 'SELECT transaction_group_id FROM transaction_groups WHERE permit_number = ?';
+    if (transactionType) {
+      sql += ' AND transaction_type = ?';
+      params.push(transactionType);
+    }
+    sql += ' LIMIT 1';
+
     const [rows] = await db.query(
-      'SELECT transaction_group_id FROM transaction_groups WHERE permit_number = ? LIMIT 1',
-      [permitNumber.trim()]
+      sql,
+      params
     );
     res.json({ exists: rows.length > 0 });
   } catch (error) {
