@@ -2001,7 +2001,7 @@ app.get('/api/customers/:id/transaction-groups', authMiddleware, async (req, res
   }
 });
 
-app.post('/api/customers', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
+app.post('/api/customers', authMiddleware, requireMinRole('manager'), async (req, res) => {
   try {
     const { name, phone, email, notes } = req.body || {};
     const customerName = typeof name === 'string' ? name.trim() : '';
