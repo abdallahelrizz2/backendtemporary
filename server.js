@@ -33,6 +33,16 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+const SERVER_STARTED_AT = new Date().toISOString();
+const BUILD_INFO = {
+  version: process.env.APP_VERSION || process.env.npm_package_version || '1.0.0',
+  build: process.env.BUILD_ID || process.env.GIT_SHA || process.env.SOURCE_VERSION || 'local',
+  started_at: SERVER_STARTED_AT,
+  capabilities: {
+    supportsAtomicPermitEdit: true,
+    supportsTransactionEditPreview: true
+  }
+};
 
 console.log("=== SERVER STARTUP ===");
 console.log("SERVER.JS LOADED — REAL FILE");
@@ -7015,6 +7025,398 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
   }
 });
 
+const round2Edit = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
+const hasNegativeEditInventory = ({ meters, yards, rolls }) => (
+  meters < -0.005 || yards < -0.005 || rolls < 0
+);
+
+function normalizeEditAmounts(item, sourceLog = null) {
+  const fallbackMeters = sourceLog ? parseFloat(sourceLog.amount_meters) || 0 : 0;
+  const fallbackYards = sourceLog ? parseFloat(sourceLog.amount_yards) || 0 : 0;
+  const fallbackRolls = sourceLog ? parseInt(sourceLog.roll_count, 10) || 0 : 0;
+
+  if (item.amount_yards != null && parseFloat(item.amount_yards) > 0) {
+    const yards = round2Edit(parseFloat(item.amount_yards));
+    return {
+      meters: round2Edit(yards / 1.0936),
+      yards,
+      rolls: item.roll_count != null ? parseInt(item.roll_count, 10) || 0 : fallbackRolls
+    };
+  }
+
+  if (item.amount_meters != null && parseFloat(item.amount_meters) > 0) {
+    const meters = round2Edit(parseFloat(item.amount_meters));
+    return {
+      meters,
+      yards: round2Edit(meters * 1.0936),
+      rolls: item.roll_count != null ? parseInt(item.roll_count, 10) || 0 : fallbackRolls
+    };
+  }
+
+  return {
+    meters: fallbackMeters,
+    yards: fallbackYards,
+    rolls: item.roll_count != null ? parseInt(item.roll_count, 10) || 0 : fallbackRolls
+  };
+}
+
+function formatEditShortageMessage(shortages) {
+  const parts = [];
+  if (shortages.yards > 0.005) parts.push(`${shortages.yards.toFixed(2)}yd`);
+  if (shortages.meters > 0.005) parts.push(`${shortages.meters.toFixed(2)}m`);
+  if (shortages.rolls > 0) parts.push(`${shortages.rolls} roll${shortages.rolls === 1 ? '' : 's'}`);
+  return parts.join(', ') || 'inventory';
+}
+
+async function buildTransactionEditPreview(connection, groupId, items, { lockRows = false } = {}) {
+  if (!items || !Array.isArray(items) || items.length === 0) {
+    const err = new Error('items array is required and must not be empty');
+    err.status = 400;
+    throw err;
+  }
+
+  const validActions = ['update', 'remove', 'add'];
+  for (const item of items) {
+    if (!validActions.includes(item.action)) {
+      const err = new Error(`Invalid action "${item.action}". Must be one of: update, remove, add`);
+      err.status = 400;
+      throw err;
+    }
+    if ((item.action === 'update' || item.action === 'remove') && item.log_id == null) {
+      const err = new Error(`log_id is required for action "${item.action}"`);
+      err.status = 400;
+      throw err;
+    }
+    if (item.action === 'add') {
+      if (item.fabric_id == null || item.color_id == null) {
+        const err = new Error('fabric_id and color_id are required for action "add"');
+        err.status = 400;
+        throw err;
+      }
+      if (item.amount_meters == null && item.amount_yards == null) {
+        const err = new Error('amount_meters or amount_yards is required for action "add"');
+        err.status = 400;
+        throw err;
+      }
+    }
+  }
+
+  const [groups] = await connection.query(
+    'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
+    [groupId]
+  );
+  if (groups.length === 0) {
+    const err = new Error(`Transaction group not found: ${groupId}`);
+    err.status = 404;
+    throw err;
+  }
+
+  const group = groups[0];
+  if (group.transaction_type !== 'A' && group.transaction_type !== 'B' && group.transaction_type !== 'sell' && group.transaction_type !== 'return') {
+    const err = new Error(`Only sell-type and return-type transactions can be edited. This group has type: ${group.transaction_type}`);
+    err.status = 400;
+    throw err;
+  }
+  if (group.transaction_type === 'return' && group.edited_at) {
+    const err = new Error('This return has already been edited once and is now locked.');
+    err.status = 409;
+    throw err;
+  }
+
+  const referencedLogIds = items
+    .filter(item => item.action === 'update' || item.action === 'remove')
+    .map(item => parseInt(item.log_id, 10));
+  const sourceLogMap = {};
+
+  if (referencedLogIds.length > 0) {
+    const placeholders = referencedLogIds.map(() => '?').join(', ');
+    const [sourceLogs] = await connection.query(
+      `SELECT log_id, type, transaction_group_id, fabric_id, color_id, fabric_name, color_name,
+              amount_meters, amount_yards, roll_count, weight, lot, roll_nb,
+              notes, timestamp, epoch, timezone, salesperson_id, conducted_by_user_id
+       FROM logs WHERE log_id IN (${placeholders})`,
+      referencedLogIds
+    );
+    for (const log of sourceLogs) sourceLogMap[log.log_id] = log;
+
+    for (const item of items) {
+      if (item.action !== 'update' && item.action !== 'remove') continue;
+      const source = sourceLogMap[parseInt(item.log_id, 10)];
+      if (!source) {
+        const err = new Error(`Log not found: ${item.log_id}`);
+        err.status = 400;
+        throw err;
+      }
+      if (String(source.transaction_group_id) !== String(groupId)) {
+        const err = new Error(`Log ${item.log_id} does not belong to transaction group ${groupId}`);
+        err.status = 400;
+        throw err;
+      }
+      if (group.transaction_type === 'return' && source.type !== 'return') {
+        const err = new Error(`Log ${item.log_id} is not a return log (type: ${source.type}); only return logs can be edited in a return transaction`);
+        err.status = 400;
+        throw err;
+      }
+      if (group.transaction_type !== 'return' && source.type !== 'sell') {
+        const err = new Error(`Log ${item.log_id} is not a sell log (type: ${source.type}); only sell logs can be edited`);
+        err.status = 400;
+        throw err;
+      }
+      if (!source.fabric_id || !source.color_id) {
+        const err = new Error(`Log ${item.log_id} has no fabric_id or color_id`);
+        err.status = 400;
+        throw err;
+      }
+    }
+  }
+
+  for (const item of items) {
+    if (item.action !== 'update' && item.action !== 'add') continue;
+    const source = item.action === 'update' ? sourceLogMap[parseInt(item.log_id, 10)] : null;
+    const amounts = normalizeEditAmounts(item, source);
+    if (Number.isNaN(amounts.meters) || amounts.meters < 0) {
+      const err = new Error(item.action === 'update' ? `Invalid amount_meters for log ${item.log_id}` : 'Invalid amount_meters for add item');
+      err.status = 400;
+      throw err;
+    }
+    if (Number.isNaN(amounts.yards) || amounts.yards < 0) {
+      const err = new Error(item.action === 'update' ? `Invalid amount_yards for log ${item.log_id}` : 'Invalid amount_yards for add item');
+      err.status = 400;
+      throw err;
+    }
+    if (Number.isNaN(amounts.rolls) || amounts.rolls < 0) {
+      const err = new Error(item.action === 'update' ? `Invalid roll_count for log ${item.log_id}` : 'Invalid roll_count for add item');
+      err.status = 400;
+      throw err;
+    }
+    if (item.action === 'add' && amounts.meters <= 0 && amounts.yards <= 0) {
+      const err = new Error('amount_meters or amount_yards must be positive for action "add"');
+      err.status = 400;
+      throw err;
+    }
+  }
+
+  const colorState = new Map();
+  const loadColor = async (fabricId, colorId) => {
+    const key = `${fabricId}:${colorId}`;
+    if (colorState.has(key)) return colorState.get(key);
+    const lockClause = lockRows ? ' FOR UPDATE' : '';
+    const [rows] = await connection.query(
+      `SELECT color_id, fabric_id, color_name, length_meters, length_yards,
+              roll_count, weight, lot, roll_nb, status, sold
+       FROM colors WHERE color_id = ? AND fabric_id = ?${lockClause}`,
+      [colorId, fabricId]
+    );
+    if (rows.length === 0) {
+      const err = new Error(`Color not found: fabric_id=${fabricId}, color_id=${colorId}`);
+      err.status = 404;
+      throw err;
+    }
+    const row = rows[0];
+    const state = {
+      ...row,
+      length_meters: parseFloat(row.length_meters) || 0,
+      length_yards: parseFloat(row.length_yards) || 0,
+      roll_count: parseInt(row.roll_count, 10) || 0
+    };
+    colorState.set(key, state);
+    return state;
+  };
+
+  const updateRemoveItems = items
+    .filter(item => item.action === 'update' || item.action === 'remove')
+    .sort((a, b) => (parseInt(a.log_id, 10) || 0) - (parseInt(b.log_id, 10) || 0));
+  const addItems = items.filter(item => item.action === 'add');
+  const previewItems = [];
+  const noteItems = [];
+
+  const pushPreview = ({ item, source = null, color, before, after, delta, shortages, reason }) => {
+    const hasShortage = hasNegativeEditInventory({
+      meters: after.meters,
+      yards: after.yards,
+      rolls: after.rolls
+    });
+    const entry = {
+      action: item.action,
+      client_key: item.client_key || null,
+      log_id: item.log_id != null ? parseInt(item.log_id, 10) : null,
+      fabric_id: source?.fabric_id || item.fabric_id || null,
+      color_id: source?.color_id || item.color_id || null,
+      fabric_name: source?.fabric_name || null,
+      color_name: source?.color_name || color?.color_name || null,
+      current_meters: round2Edit(before.meters),
+      current_yards: round2Edit(before.yards),
+      current_rolls: before.rolls,
+      delta_meters: round2Edit(delta.meters),
+      delta_yards: round2Edit(delta.yards),
+      delta_rolls: delta.rolls,
+      resulting_meters: round2Edit(after.meters),
+      resulting_yards: round2Edit(after.yards),
+      resulting_rolls: after.rolls,
+      shortage_meters: Math.max(0, round2Edit(shortages.meters || 0)),
+      shortage_yards: Math.max(0, round2Edit(shortages.yards || 0)),
+      shortage_rolls: Math.max(0, shortages.rolls || 0),
+      requires_note: hasShortage,
+      note_provided: !!(item.notes && String(item.notes).trim()),
+      reason: reason || null
+    };
+    previewItems.push(entry);
+    if (hasShortage) noteItems.push(entry);
+  };
+
+  for (const item of updateRemoveItems) {
+    const source = sourceLogMap[parseInt(item.log_id, 10)];
+    const fabricId = source.fabric_id;
+    const colorId = source.color_id;
+    const color = await loadColor(fabricId, colorId);
+    const before = {
+      meters: color.length_meters,
+      yards: color.length_yards,
+      rolls: color.roll_count
+    };
+    const original = {
+      meters: parseFloat(source.amount_meters) || 0,
+      yards: parseFloat(source.amount_yards) || 0,
+      rolls: parseInt(source.roll_count, 10) || 0
+    };
+
+    if (item.action === 'remove') {
+      const isReturnRemove = group.transaction_type === 'return';
+      const sign = isReturnRemove ? -1 : 1;
+      const after = {
+        meters: round2Edit(before.meters + sign * original.meters),
+        yards: round2Edit(before.yards + sign * original.yards),
+        rolls: before.rolls + sign * original.rolls
+      };
+      color.length_meters = Math.max(0, after.meters);
+      color.length_yards = Math.max(0, after.yards);
+      color.roll_count = Math.max(0, after.rolls);
+      pushPreview({
+        item,
+        source,
+        color,
+        before,
+        after,
+        delta: {
+          meters: sign * original.meters,
+          yards: sign * original.yards,
+          rolls: sign * original.rolls
+        },
+        shortages: {
+          meters: Math.max(0, -after.meters),
+          yards: Math.max(0, -after.yards),
+          rolls: Math.max(0, -after.rolls)
+        },
+        reason: isReturnRemove ? 'Removing this return deducts already returned inventory.' : null
+      });
+      continue;
+    }
+
+    const next = normalizeEditAmounts(item, source);
+    if (group.transaction_type === 'return' && next.yards > original.yards + 0.005) {
+      const err = new Error(`Cannot increase return amount beyond original: ${original.yards} yards for ${source.fabric_name || 'item'}`);
+      err.status = 400;
+      throw err;
+    }
+
+    const rawDelta = {
+      meters: round2Edit(next.meters - original.meters),
+      yards: round2Edit(next.yards - original.yards),
+      rolls: next.rolls - original.rolls
+    };
+    const inventorySign = group.transaction_type === 'return' ? 1 : -1;
+    const inventoryDelta = {
+      meters: round2Edit(inventorySign * rawDelta.meters),
+      yards: round2Edit(inventorySign * rawDelta.yards),
+      rolls: inventorySign * rawDelta.rolls
+    };
+    const after = {
+      meters: round2Edit(before.meters + inventoryDelta.meters),
+      yards: round2Edit(before.yards + inventoryDelta.yards),
+      rolls: before.rolls + inventoryDelta.rolls
+    };
+    color.length_meters = Math.max(0, after.meters);
+    color.length_yards = Math.max(0, after.yards);
+    color.roll_count = Math.max(0, after.rolls);
+    pushPreview({
+      item,
+      source,
+      color,
+      before,
+      after,
+      delta: rawDelta,
+      shortages: {
+        meters: Math.max(0, -after.meters),
+        yards: Math.max(0, -after.yards),
+        rolls: Math.max(0, -after.rolls)
+      },
+      reason: rawDelta.yards > 0 || rawDelta.rolls > 0
+        ? 'Only the increase above the original committed line is treated as new stock pressure.'
+        : null
+    });
+  }
+
+  for (const item of addItems) {
+    const fabricId = parseInt(item.fabric_id, 10);
+    const colorId = parseInt(item.color_id, 10);
+    const color = await loadColor(fabricId, colorId);
+    const before = {
+      meters: color.length_meters,
+      yards: color.length_yards,
+      rolls: color.roll_count
+    };
+    const added = normalizeEditAmounts(item);
+    const after = {
+      meters: round2Edit(before.meters - added.meters),
+      yards: round2Edit(before.yards - added.yards),
+      rolls: before.rolls - added.rolls
+    };
+    color.length_meters = Math.max(0, after.meters);
+    color.length_yards = Math.max(0, after.yards);
+    color.roll_count = Math.max(0, after.rolls);
+    pushPreview({
+      item,
+      color,
+      before,
+      after,
+      delta: added,
+      shortages: {
+        meters: Math.max(0, -after.meters),
+        yards: Math.max(0, -after.yards),
+        rolls: Math.max(0, -after.rolls)
+      },
+      reason: 'New line in an already committed transaction.'
+    });
+  }
+
+  return {
+    group: {
+      transaction_group_id: group.transaction_group_id,
+      transaction_type: group.transaction_type,
+      permit_number: group.permit_number || null
+    },
+    previewItems,
+    noteItems,
+    requiresNote: noteItems.length > 0
+  };
+}
+
+// POST /api/transactions/:groupId/edit/preview - Preview edit deltas and note requirements without writing
+app.post('/api/transactions/:groupId/edit/preview', authMiddleware, requireMinRole('manager'), async (req, res) => {
+  try {
+    const preview = await buildTransactionEditPreview(db, req.params.groupId, req.body?.items || []);
+    res.json({
+      success: true,
+      ...preview
+    });
+  } catch (err) {
+    console.error('Error in POST /api/transactions/:groupId/edit/preview:', err);
+    res.status(err.status || 500).json({
+      error: err.status ? err.message : 'Failed to preview transaction edit'
+    });
+  }
+});
+
 // PUT /api/transactions/:groupId/edit - Edit a sell-type transaction group
 // Supports three actions per item: "update" (change amounts), "remove" (delete item), "add" (new item)
 // All inventory changes are applied atomically; inventory cannot go below 0.
@@ -7091,7 +7493,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
         if (!src) {
           return res.status(400).json({ error: `Log not found: ${it.log_id}` });
         }
-        if (src.transaction_group_id !== groupId) {
+        if (String(src.transaction_group_id) !== String(groupId)) {
           return res.status(400).json({ error: `Log ${it.log_id} does not belong to transaction group ${groupId}` });
         }
         if (group.transaction_type === 'return' && src.type !== 'return') {
@@ -7146,6 +7548,22 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
     const userId = req.user ? req.user.user_id : null;
     const isPrivileged = hasMinRole(req.user.role, 'manager');
     const overrideNote = note && note.trim() ? note.trim() : null;
+
+    const editPreview = await buildTransactionEditPreview(connection, groupId, items, { lockRows: true });
+    const missingNoteItems = editPreview.noteItems.filter(item => !overrideNote && !item.note_provided);
+    if (missingNoteItems.length > 0) {
+      const first = missingNoteItems[0];
+      await connection.rollback();
+      return res.status(400).json({
+        error: `Editing ${first.fabric_name || 'item'} / ${first.color_name || first.color_id} would exceed inventory by ${formatEditShortageMessage({
+          meters: first.shortage_meters,
+          yards: first.shortage_yards,
+          rolls: first.shortage_rolls
+        })}. A note is required to override.`,
+        requiresNote: true,
+        noteItems: editPreview.noteItems
+      });
+    }
 
     // Process items sorted by log_id (update/remove) then adds, to avoid deadlocks
     const updateRemoveItems = items
@@ -7272,13 +7690,14 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
         const updatedMeters = round2((parseFloat(color.length_meters) || 0) + inventorySign * deltaMeters);
         const updatedYards = round2((parseFloat(color.length_yards) || 0) + inventorySign * deltaYards);
         const updatedRollCount = (parseInt(color.roll_count) || 0) + inventorySign * deltaRolls;
+        const itemOverrideNote = it.notes && String(it.notes).trim() ? String(it.notes).trim() : overrideNote;
 
-        if (updatedMeters < -0.005 || updatedYards < -0.005) {
+        if (updatedMeters < -0.005 || updatedYards < -0.005 || updatedRollCount < 0) {
           if (!isPrivileged) {
             await connection.rollback();
-            return res.status(400).json({ error: `Insufficient inventory for log ${it.log_id}. Updating would result in negative inventory (meters: ${updatedMeters.toFixed(2)}, yards: ${updatedYards.toFixed(2)})` });
+            return res.status(400).json({ error: `Insufficient inventory for log ${it.log_id}. Updating would result in negative inventory (meters: ${updatedMeters.toFixed(2)}, yards: ${updatedYards.toFixed(2)}, rolls: ${updatedRollCount})` });
           }
-          if (!overrideNote) {
+          if (!itemOverrideNote) {
             await connection.rollback();
             return res.status(400).json({ error: `Updating log ${it.log_id} would result in negative inventory. A note is required to override.`, requiresNote: true });
           }
@@ -7319,11 +7738,11 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
         const oldLogRecord = oldLogRows[0];
 
         await connection.query(
-          overrideNote
+          itemOverrideNote
             ? 'UPDATE logs SET amount_meters = ?, amount_yards = ?, roll_count = ?, notes = ? WHERE log_id = ?'
             : 'UPDATE logs SET amount_meters = ?, amount_yards = ?, roll_count = ? WHERE log_id = ?',
-          overrideNote
-            ? [newMetersVal, newYardsVal, newRollsVal, overrideNote, parseInt(it.log_id)]
+          itemOverrideNote
+            ? [newMetersVal, newYardsVal, newRollsVal, itemOverrideNote, parseInt(it.log_id)]
             : [newMetersVal, newYardsVal, newRollsVal, parseInt(it.log_id)]
         );
 
@@ -7381,14 +7800,16 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
       // Validate enough inventory
       const currentYards = parseFloat(color.length_yards) || 0;
       const currentMeters = parseFloat(color.length_meters) || 0;
-      if (currentYards < addYards - 0.005) {
+      const currentRollCount = parseInt(color.roll_count) || 0;
+      const itemOverrideNote = it.notes && String(it.notes).trim() ? String(it.notes).trim() : overrideNote;
+      if (currentYards < addYards - 0.005 || currentRollCount < addRolls) {
         if (!isPrivileged) {
           await connection.rollback();
-          return res.status(400).json({ error: `Insufficient inventory for add item (color_id=${colorId}). Available: ${currentYards.toFixed(2)}yd, Requested: ${addYards.toFixed(2)}yd` });
+          return res.status(400).json({ error: `Insufficient inventory for add item (color_id=${colorId}). Available: ${currentYards.toFixed(2)}yd / ${currentRollCount} rolls, Requested: ${addYards.toFixed(2)}yd / ${addRolls} rolls` });
         }
-        if (!overrideNote) {
+        if (!itemOverrideNote) {
           await connection.rollback();
-          return res.status(400).json({ error: `Insufficient inventory for add item (color_id=${colorId}). Available: ${currentYards.toFixed(2)}yd, Requested: ${addYards.toFixed(2)}yd. A note is required to override.`, requiresNote: true });
+          return res.status(400).json({ error: `Insufficient inventory for add item (color_id=${colorId}). Available: ${currentYards.toFixed(2)}yd / ${currentRollCount} rolls, Requested: ${addYards.toFixed(2)}yd / ${addRolls} rolls. A note is required to override.`, requiresNote: true });
         }
       }
 
@@ -7399,7 +7820,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
       // Deduct from inventory
       const newYards = round2(currentYards - addYards);
       const newMeters = round2(currentMeters - addMeters);
-      const newRollCount = Math.max(0, (parseInt(color.roll_count) || 0) - addRolls);
+      const newRollCount = Math.max(0, currentRollCount - addRolls);
       const newSold = newMeters <= 0 ? 1 : 0;
 
       await connection.query(
@@ -7457,7 +7878,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
           color.weight || 'N/A',
           it.lot || color.lot || null,
           it.roll_nb || color.roll_nb || null,
-          it.notes || null,
+          itemOverrideNote || null,
           groupTimestamp,
           groupEpoch,
           group.timezone || 'Asia/Beirut',
@@ -8051,7 +8472,11 @@ app.get('/api/salespersons/stats', authMiddleware, async (req, res) => {
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: 'RisetexCo API is running' });
+  res.json({ status: 'ok', message: 'RisetexCo API is running', build: BUILD_INFO });
+});
+
+app.get('/api/version', (req, res) => {
+  res.json(BUILD_INFO);
 });
 
 // Monthly sales report endpoint
