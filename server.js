@@ -5961,6 +5961,7 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
         timestamp: log.timestamp,
         epoch: log.epoch,
         timezone: log.timezone,
+        reference_log_id: log.reference_log_id || null,
         transaction_group_id: log.transaction_group_id || null,
         created_at: log.created_at,
         updated_at: log.updated_at,
@@ -5978,6 +5979,7 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
         rollCount: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : 0,
         tz: log.timezone,
         isTrimmable: Boolean(log.is_trimmable),
+        referenceLogId: log.reference_log_id || null,
         transactionGroupId: log.transaction_group_id || null
       };
     });
