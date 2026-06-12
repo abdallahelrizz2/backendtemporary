@@ -7068,6 +7068,21 @@ function formatEditShortageMessage(shortages) {
   return parts.join(', ') || 'inventory';
 }
 
+function resolveTransactionEditKind(group, sourceLogs = []) {
+  const declaredType = String(group?.transaction_type || '').toLowerCase();
+  const sourceTypes = [...new Set((sourceLogs || []).map(log => String(log.type || '').toLowerCase()))]
+    .filter(type => type === 'sell' || type === 'return');
+
+  if (sourceTypes.length > 1) {
+    const err = new Error('Cannot edit sell and return log rows in the same request.');
+    err.status = 400;
+    throw err;
+  }
+
+  if (sourceTypes.length === 1) return sourceTypes[0];
+  return declaredType === 'return' ? 'return' : 'sell';
+}
+
 async function buildTransactionEditPreview(connection, groupId, items, { lockRows = false } = {}) {
   if (!items || !Array.isArray(items) || items.length === 0) {
     const err = new Error('items array is required and must not be empty');
@@ -7112,14 +7127,10 @@ async function buildTransactionEditPreview(connection, groupId, items, { lockRow
   }
 
   const group = groups[0];
-  if (group.transaction_type !== 'A' && group.transaction_type !== 'B' && group.transaction_type !== 'sell' && group.transaction_type !== 'return') {
+  const groupType = String(group.transaction_type || '').toLowerCase();
+  if (!['a', 'b', 'sell', 'return'].includes(groupType)) {
     const err = new Error(`Only sell-type and return-type transactions can be edited. This group has type: ${group.transaction_type}`);
     err.status = 400;
-    throw err;
-  }
-  if (group.transaction_type === 'return' && group.edited_at) {
-    const err = new Error('This return has already been edited once and is now locked.');
-    err.status = 409;
     throw err;
   }
 
@@ -7127,6 +7138,7 @@ async function buildTransactionEditPreview(connection, groupId, items, { lockRow
     .filter(item => item.action === 'update' || item.action === 'remove')
     .map(item => parseInt(item.log_id, 10));
   const sourceLogMap = {};
+  let sourceLogsForKind = [];
 
   if (referencedLogIds.length > 0) {
     const placeholders = referencedLogIds.map(() => '?').join(', ');
@@ -7137,6 +7149,7 @@ async function buildTransactionEditPreview(connection, groupId, items, { lockRow
        FROM logs WHERE log_id IN (${placeholders})`,
       referencedLogIds
     );
+    sourceLogsForKind = sourceLogs;
     for (const log of sourceLogs) sourceLogMap[log.log_id] = log;
 
     for (const item of items) {
@@ -7152,13 +7165,9 @@ async function buildTransactionEditPreview(connection, groupId, items, { lockRow
         err.status = 400;
         throw err;
       }
-      if (group.transaction_type === 'return' && source.type !== 'return') {
-        const err = new Error(`Log ${item.log_id} is not a return log (type: ${source.type}); only return logs can be edited in a return transaction`);
-        err.status = 400;
-        throw err;
-      }
-      if (group.transaction_type !== 'return' && source.type !== 'sell') {
-        const err = new Error(`Log ${item.log_id} is not a sell log (type: ${source.type}); only sell logs can be edited`);
+      const sourceType = String(source.type || '').toLowerCase();
+      if (sourceType !== 'sell' && sourceType !== 'return') {
+        const err = new Error(`Log ${item.log_id} is not editable (type: ${source.type}); only sell and return logs can be edited`);
         err.status = 400;
         throw err;
       }
@@ -7168,6 +7177,18 @@ async function buildTransactionEditPreview(connection, groupId, items, { lockRow
         throw err;
       }
     }
+  }
+
+  const editKind = resolveTransactionEditKind(group, sourceLogsForKind);
+  if (editKind === 'return' && group.edited_at) {
+    const err = new Error('This return has already been edited once and is now locked.');
+    err.status = 409;
+    throw err;
+  }
+  if (editKind === 'return' && items.some(item => item.action === 'add')) {
+    const err = new Error('Return transactions cannot add new items during edit. Edit existing return rows or cancel/recreate the return.');
+    err.status = 400;
+    throw err;
   }
 
   for (const item of items) {
@@ -7281,7 +7302,7 @@ async function buildTransactionEditPreview(connection, groupId, items, { lockRow
     };
 
     if (item.action === 'remove') {
-      const isReturnRemove = group.transaction_type === 'return';
+      const isReturnRemove = editKind === 'return';
       const sign = isReturnRemove ? -1 : 1;
       const after = {
         meters: round2Edit(before.meters + sign * original.meters),
@@ -7313,7 +7334,7 @@ async function buildTransactionEditPreview(connection, groupId, items, { lockRow
     }
 
     const next = normalizeEditAmounts(item, source);
-    if (group.transaction_type === 'return' && next.yards > original.yards + 0.005) {
+    if (editKind === 'return' && next.yards > original.yards + 0.005) {
       const err = new Error(`Cannot increase return amount beyond original: ${original.yards} yards for ${source.fabric_name || 'item'}`);
       err.status = 400;
       throw err;
@@ -7324,7 +7345,7 @@ async function buildTransactionEditPreview(connection, groupId, items, { lockRow
       yards: round2Edit(next.yards - original.yards),
       rolls: next.rolls - original.rolls
     };
-    const inventorySign = group.transaction_type === 'return' ? 1 : -1;
+    const inventorySign = editKind === 'return' ? 1 : -1;
     const inventoryDelta = {
       meters: round2Edit(inventorySign * rawDelta.meters),
       yards: round2Edit(inventorySign * rawDelta.yards),
@@ -7458,13 +7479,9 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
       return res.status(404).json({ error: `Transaction group not found: ${groupId}` });
     }
     const group = groups[0];
-    if (group.transaction_type !== 'A' && group.transaction_type !== 'B' && group.transaction_type !== 'sell' && group.transaction_type !== 'return') {
+    const groupType = String(group.transaction_type || '').toLowerCase();
+    if (!['a', 'b', 'sell', 'return'].includes(groupType)) {
       return res.status(400).json({ error: `Only sell-type and return-type transactions can be edited. This group has type: ${group.transaction_type}` });
-    }
-
-    // Check if return is already edited (locked)
-    if (group.transaction_type === 'return' && group.edited_at) {
-      return res.status(409).json({ error: 'This return has already been edited once and is now locked.' });
     }
 
     // --- Collect all log_ids that need to be validated (update + remove) ---
@@ -7473,6 +7490,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
       .map(it => parseInt(it.log_id));
 
     let sourceLogMap = {};
+    let sourceLogsForKind = [];
     if (referencedLogIds.length > 0) {
       const placeholders = referencedLogIds.map(() => '?').join(', ');
       const [sourceLogs] = await db.query(
@@ -7482,11 +7500,12 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
          FROM logs WHERE log_id IN (${placeholders})`,
         referencedLogIds
       );
+      sourceLogsForKind = sourceLogs;
       for (const log of sourceLogs) {
         sourceLogMap[log.log_id] = log;
       }
 
-      // Validate each referenced log belongs to this group and is a sell log
+      // Validate each referenced log belongs to this group and is editable
       for (const it of items) {
         if (it.action !== 'update' && it.action !== 'remove') continue;
         const src = sourceLogMap[parseInt(it.log_id)];
@@ -7496,11 +7515,9 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
         if (String(src.transaction_group_id) !== String(groupId)) {
           return res.status(400).json({ error: `Log ${it.log_id} does not belong to transaction group ${groupId}` });
         }
-        if (group.transaction_type === 'return' && src.type !== 'return') {
-          return res.status(400).json({ error: `Log ${it.log_id} is not a return log (type: ${src.type}); only return logs can be edited in a return transaction` });
-        }
-        if (group.transaction_type !== 'return' && src.type !== 'sell') {
-          return res.status(400).json({ error: `Log ${it.log_id} is not a sell log (type: ${src.type}); only sell logs can be edited` });
+        const srcType = String(src.type || '').toLowerCase();
+        if (srcType !== 'sell' && srcType !== 'return') {
+          return res.status(400).json({ error: `Log ${it.log_id} is not editable (type: ${src.type}); only sell and return logs can be edited` });
         }
         if (!src.fabric_id || !src.color_id) {
           return res.status(400).json({ error: `Log ${it.log_id} has no fabric_id or color_id` });
@@ -7539,6 +7556,20 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
       if ((addMeters == null || addMeters <= 0) && (addYards == null || addYards <= 0)) {
         return res.status(400).json({ error: 'amount_meters or amount_yards must be positive for action "add"' });
       }
+    }
+
+    let editKind;
+    try {
+      editKind = resolveTransactionEditKind(group, sourceLogsForKind);
+    } catch (err) {
+      return res.status(err.status || 400).json({ error: err.message });
+    }
+
+    if (editKind === 'return' && group.edited_at) {
+      return res.status(409).json({ error: 'This return has already been edited once and is now locked.' });
+    }
+    if (editKind === 'return' && items.some(item => item.action === 'add')) {
+      return res.status(400).json({ error: 'Return transactions cannot add new items during edit. Edit existing return rows or cancel/recreate the return.' });
     }
 
     // --- All validations passed — begin DB transaction ---
@@ -7605,7 +7636,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
 
         // For sell remove: restore original amounts to inventory (+)
         // For return remove: deduct original amounts from inventory (-) since the return is being undone
-        const isReturnRemove = group.transaction_type === 'return';
+        const isReturnRemove = editKind === 'return';
         const removeSign = isReturnRemove ? -1 : 1;
         const newMeters = round2((parseFloat(color.length_meters) || 0) + removeSign * origMeters);
         const newYards = round2((parseFloat(color.length_yards) || 0) + removeSign * origYards);
@@ -7654,7 +7685,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
         const newRollsVal = newRollsRaw;
 
         // For return transactions, validate that updated amounts don't exceed original returned amounts
-        if (group.transaction_type === 'return') {
+        if (editKind === 'return') {
           if (newYardsVal > origYards + 0.005) {
             await connection.rollback();
             return res.status(400).json({
@@ -7685,7 +7716,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
         // Apply delta to inventory
         // For sell: positive delta = sold more = inventory decreases (inventory -= delta)
         // For return: positive delta = more returned = inventory increases (inventory += delta)
-        const isReturnGroup = group.transaction_type === 'return';
+        const isReturnGroup = editKind === 'return';
         const inventorySign = isReturnGroup ? 1 : -1;
         const updatedMeters = round2((parseFloat(color.length_meters) || 0) + inventorySign * deltaMeters);
         const updatedYards = round2((parseFloat(color.length_yards) || 0) + inventorySign * deltaYards);
@@ -7756,7 +7787,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
           oldLogRecord,
           newLogRecord,
           req,
-          `Edit sell group ${groupId} — updated amounts: ${origYards.toFixed(2)}yd → ${newYardsVal.toFixed(2)}yd, ${origMeters.toFixed(2)}m → ${newMetersVal.toFixed(2)}m`
+          `Edit ${editKind} group ${groupId} — updated amounts: ${origYards.toFixed(2)}yd → ${newYardsVal.toFixed(2)}yd, ${origMeters.toFixed(2)}m → ${newMetersVal.toFixed(2)}m`
         );
 
         // Update totals delta
@@ -7913,7 +7944,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
     }
 
     // Set edited_at for return transactions (locks them from further edits)
-    if (group.transaction_type === 'return') {
+    if (editKind === 'return') {
       await connection.query(
         'UPDATE transaction_groups SET edited_at = NOW() WHERE transaction_group_id = ?',
         [groupId]
