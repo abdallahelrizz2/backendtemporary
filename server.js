@@ -7037,7 +7037,7 @@ function normalizeEditAmounts(item, sourceLog = null) {
   const fallbackYards = sourceLog ? parseFloat(sourceLog.amount_yards) || 0 : 0;
   const fallbackRolls = sourceLog ? parseInt(sourceLog.roll_count, 10) || 0 : 0;
 
-  if (item.amount_yards != null && parseFloat(item.amount_yards) > 0) {
+  if (item.amount_yards != null && item.amount_yards !== '') {
     const yards = round2Edit(parseFloat(item.amount_yards));
     return {
       meters: round2Edit(yards / 1.0936),
@@ -7046,7 +7046,7 @@ function normalizeEditAmounts(item, sourceLog = null) {
     };
   }
 
-  if (item.amount_meters != null && parseFloat(item.amount_meters) > 0) {
+  if (item.amount_meters != null && item.amount_meters !== '') {
     const meters = round2Edit(parseFloat(item.amount_meters));
     return {
       meters,
@@ -7068,6 +7068,163 @@ function formatEditShortageMessage(shortages) {
   if (shortages.meters > 0.005) parts.push(`${shortages.meters.toFixed(2)}m`);
   if (shortages.rolls > 0) parts.push(`${shortages.rolls} roll${shortages.rolls === 1 ? '' : 's'}`);
   return parts.join(', ') || 'inventory';
+}
+
+async function validateReturnEditTotals(connection, groupId, items, { lockRows = false } = {}) {
+  const lockClause = lockRows ? ' FOR UPDATE' : '';
+  const [currentReturnRows] = await connection.query(
+    `SELECT log_id, type, transaction_group_id, fabric_id, color_id, fabric_name, color_name,
+            amount_meters, amount_yards, roll_count, reference_log_id
+     FROM logs
+     WHERE transaction_group_id = ? AND type = 'return'${lockClause}`,
+    [groupId]
+  );
+
+  if (currentReturnRows.length === 0) {
+    const err = new Error('Return transaction has no return rows to edit.');
+    err.status = 400;
+    throw err;
+  }
+
+  const actionByLogId = new Map();
+  for (const item of items) {
+    if (item.action === 'update' || item.action === 'remove') {
+      actionByLogId.set(parseInt(item.log_id, 10), item);
+    }
+  }
+
+  const plannedByReference = new Map();
+  const addPlanned = (referenceLogId, delta) => {
+    const key = String(referenceLogId || '');
+    const current = plannedByReference.get(key) || {
+      referenceLogId,
+      meters: 0,
+      yards: 0,
+      rolls: 0,
+      fabricName: delta.fabricName || null,
+      colorName: delta.colorName || null,
+    };
+    current.meters += delta.meters;
+    current.yards += delta.yards;
+    current.rolls += delta.rolls;
+    if (!current.fabricName) current.fabricName = delta.fabricName || null;
+    if (!current.colorName) current.colorName = delta.colorName || null;
+    plannedByReference.set(key, current);
+  };
+
+  for (const row of currentReturnRows) {
+    const action = actionByLogId.get(parseInt(row.log_id, 10));
+    let planned = {
+      meters: parseFloat(row.amount_meters) || 0,
+      yards: parseFloat(row.amount_yards) || 0,
+      rolls: parseInt(row.roll_count, 10) || 0,
+    };
+
+    if (action?.action === 'remove') {
+      planned = { meters: 0, yards: 0, rolls: 0 };
+    } else if (action?.action === 'update') {
+      planned = normalizeEditAmounts(action, row);
+      if (Number.isNaN(planned.meters) || planned.meters < 0) {
+        const err = new Error(`Invalid amount_meters for return log ${row.log_id}`);
+        err.status = 400;
+        throw err;
+      }
+      if (Number.isNaN(planned.yards) || planned.yards < 0) {
+        const err = new Error(`Invalid amount_yards for return log ${row.log_id}`);
+        err.status = 400;
+        throw err;
+      }
+      if (Number.isNaN(planned.rolls) || planned.rolls < 0) {
+        const err = new Error(`Invalid roll_count for return log ${row.log_id}`);
+        err.status = 400;
+        throw err;
+      }
+    }
+
+    if (!row.reference_log_id) {
+      const currentYards = parseFloat(row.amount_yards) || 0;
+      const currentMeters = parseFloat(row.amount_meters) || 0;
+      const currentRolls = parseInt(row.roll_count, 10) || 0;
+      if (planned.yards > currentYards + 0.005 || planned.meters > currentMeters + 0.005 || planned.rolls > currentRolls) {
+        const err = new Error(`Return log ${row.log_id} is not linked to an original sale row, so it cannot be increased safely.`);
+        err.status = 400;
+        throw err;
+      }
+      continue;
+    }
+
+    addPlanned(row.reference_log_id, {
+      ...planned,
+      fabricName: row.fabric_name,
+      colorName: row.color_name,
+    });
+  }
+
+  const referenceIds = [...plannedByReference.values()]
+    .map(entry => parseInt(entry.referenceLogId, 10))
+    .filter(id => Number.isFinite(id) && id > 0);
+
+  if (referenceIds.length === 0) return;
+
+  const placeholders = referenceIds.map(() => '?').join(', ');
+  const [saleRows] = await connection.query(
+    `SELECT log_id, type, fabric_name, color_name, amount_meters, amount_yards, roll_count
+     FROM logs
+     WHERE log_id IN (${placeholders})`,
+    referenceIds
+  );
+  const saleById = new Map(saleRows.map(row => [parseInt(row.log_id, 10), row]));
+
+  const [otherReturnRows] = await connection.query(
+    `SELECT reference_log_id,
+            COALESCE(SUM(amount_meters), 0) AS returned_meters,
+            COALESCE(SUM(amount_yards), 0) AS returned_yards,
+            COALESCE(SUM(roll_count), 0) AS returned_rolls
+     FROM logs
+     WHERE type = 'return'
+       AND reference_log_id IN (${placeholders})
+       AND transaction_group_id <> ?
+     GROUP BY reference_log_id`,
+    [...referenceIds, groupId]
+  );
+  const otherReturnsByReference = new Map(
+    otherReturnRows.map(row => [parseInt(row.reference_log_id, 10), {
+      meters: parseFloat(row.returned_meters) || 0,
+      yards: parseFloat(row.returned_yards) || 0,
+      rolls: parseInt(row.returned_rolls, 10) || 0,
+    }])
+  );
+
+  for (const planned of plannedByReference.values()) {
+    const referenceId = parseInt(planned.referenceLogId, 10);
+    const sale = saleById.get(referenceId);
+    if (!sale || String(sale.type || '').toLowerCase() !== 'sell') {
+      const err = new Error(`Original sale log not found for linked return reference ${referenceId}.`);
+      err.status = 400;
+      throw err;
+    }
+
+    const other = otherReturnsByReference.get(referenceId) || { meters: 0, yards: 0, rolls: 0 };
+    const original = {
+      meters: parseFloat(sale.amount_meters) || 0,
+      yards: parseFloat(sale.amount_yards) || 0,
+      rolls: parseInt(sale.roll_count, 10) || 0,
+    };
+    const nextTotal = {
+      meters: other.meters + planned.meters,
+      yards: other.yards + planned.yards,
+      rolls: other.rolls + planned.rolls,
+    };
+
+    if (nextTotal.yards > original.yards + 0.005 || nextTotal.meters > original.meters + 0.005 || nextTotal.rolls > original.rolls) {
+      const label = `${planned.fabricName || sale.fabric_name || 'item'} / ${planned.colorName || sale.color_name || referenceId}`;
+      const remainingYards = Math.max(0, original.yards - other.yards);
+      const remainingRolls = Math.max(0, original.rolls - other.rolls);
+      const err = new Error(`Return edit for ${label} exceeds the original sale balance. Available in this return: ${remainingYards.toFixed(2)}yd / ${remainingRolls} roll(s).`);
+      err.status = 400;
+      throw err;
+    }
+  }
 }
 
 function resolveTransactionEditKind(group, sourceLogs = []) {
@@ -7147,7 +7304,7 @@ async function buildTransactionEditPreview(connection, groupId, items, { lockRow
     const [sourceLogs] = await connection.query(
       `SELECT log_id, type, transaction_group_id, fabric_id, color_id, fabric_name, color_name,
               amount_meters, amount_yards, roll_count, weight, lot, roll_nb,
-              notes, timestamp, epoch, timezone, salesperson_id, conducted_by_user_id
+              notes, timestamp, epoch, timezone, reference_log_id, salesperson_id, conducted_by_user_id
        FROM logs WHERE log_id IN (${placeholders})`,
       referencedLogIds
     );
@@ -7182,15 +7339,13 @@ async function buildTransactionEditPreview(connection, groupId, items, { lockRow
   }
 
   const editKind = resolveTransactionEditKind(group, sourceLogsForKind);
-  if (editKind === 'return' && group.edited_at) {
-    const err = new Error('This return has already been edited once and is now locked.');
-    err.status = 409;
-    throw err;
-  }
   if (editKind === 'return' && items.some(item => item.action === 'add')) {
     const err = new Error('Return transactions cannot add new items during edit. Edit existing return rows or cancel/recreate the return.');
     err.status = 400;
     throw err;
+  }
+  if (editKind === 'return') {
+    await validateReturnEditTotals(connection, groupId, items, { lockRows });
   }
 
   for (const item of items) {
@@ -7336,12 +7491,6 @@ async function buildTransactionEditPreview(connection, groupId, items, { lockRow
     }
 
     const next = normalizeEditAmounts(item, source);
-    if (editKind === 'return' && next.yards > original.yards + 0.005) {
-      const err = new Error(`Cannot increase return amount beyond original: ${original.yards} yards for ${source.fabric_name || 'item'}`);
-      err.status = 400;
-      throw err;
-    }
-
     const rawDelta = {
       meters: round2Edit(next.meters - original.meters),
       yards: round2Edit(next.yards - original.yards),
@@ -7440,7 +7589,7 @@ app.post('/api/transactions/:groupId/edit/preview', authMiddleware, requireMinRo
   }
 });
 
-// PUT /api/transactions/:groupId/edit - Edit a sell-type transaction group
+// PUT /api/transactions/:groupId/edit - Edit a sell-type or return-type transaction group
 // Supports three actions per item: "update" (change amounts), "remove" (delete item), "add" (new item)
 // All inventory changes are applied atomically; inventory cannot go below 0.
 app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manager'), async (req, res) => {
@@ -7498,7 +7647,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
       const [sourceLogs] = await db.query(
         `SELECT log_id, type, transaction_group_id, fabric_id, color_id, fabric_name, color_name,
                 amount_meters, amount_yards, roll_count, weight, lot, roll_nb,
-                notes, timestamp, epoch, timezone, salesperson_id, conducted_by_user_id
+                notes, timestamp, epoch, timezone, reference_log_id, salesperson_id, conducted_by_user_id
          FROM logs WHERE log_id IN (${placeholders})`,
         referencedLogIds
       );
@@ -7567,9 +7716,6 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
       return res.status(err.status || 400).json({ error: err.message });
     }
 
-    if (editKind === 'return' && group.edited_at) {
-      return res.status(409).json({ error: 'This return has already been edited once and is now locked.' });
-    }
     if (editKind === 'return' && items.some(item => item.action === 'add')) {
       return res.status(400).json({ error: 'Return transactions cannot add new items during edit. Edit existing return rows or cancel/recreate the return.' });
     }
@@ -7685,16 +7831,6 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
         const newMetersVal = round2(newMetersRaw);
         const newYardsVal = round2(newYardsRaw);
         const newRollsVal = newRollsRaw;
-
-        // For return transactions, validate that updated amounts don't exceed original returned amounts
-        if (editKind === 'return') {
-          if (newYardsVal > origYards + 0.005) {
-            await connection.rollback();
-            return res.status(400).json({
-              error: `Cannot increase return amount beyond original: ${origYards} yards for ${src.fabric_name || 'item'}`
-            });
-          }
-        }
 
         const deltaMeters = newMetersVal - origMeters;
         const deltaYards = newYardsVal - origYards;
@@ -8004,6 +8140,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
         epoch: log.epoch,
         timezone: log.timezone,
         transaction_group_id: log.transaction_group_id || null,
+        reference_log_id: log.reference_log_id || null,
         created_at: log.created_at,
         // compatibility aliases
         id: log.log_id,
@@ -8017,7 +8154,8 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
         length_meters: isKgTx ? null : am,
         rollCount: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : 0,
         tz: log.timezone,
-        transactionGroupId: log.transaction_group_id || null
+        transactionGroupId: log.transaction_group_id || null,
+        referenceLogId: log.reference_log_id || null
       };
     });
 
