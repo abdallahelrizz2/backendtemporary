@@ -5932,12 +5932,185 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
       [transactionGroupId]
     );
 
+    const transactionRefLabel = (row) => ({
+      transaction_group_id: row.transaction_group_id || null,
+      permit_number: row.permit_number || null,
+      transaction_type: row.transaction_type || null,
+      transaction_date: row.transaction_date || null,
+      epoch: row.epoch || null
+    });
+
+    const uniqueRefs = (refs) => {
+      const seen = new Set();
+      const result = [];
+      for (const ref of refs) {
+        if (!ref || !ref.transaction_group_id) continue;
+        if (seen.has(ref.transaction_group_id)) continue;
+        seen.add(ref.transaction_group_id);
+        result.push(ref);
+      }
+      return result;
+    };
+
+    const sourceInfoByLogId = new Map();
+    const returnInfoBySellLogId = new Map();
+    let sourceTransactions = [];
+    let returnTransactions = [];
+
+    const referenceLogIds = [...new Set(logs
+      .filter(log => String(log.type || '').toLowerCase() === 'return' && log.reference_log_id)
+      .map(log => parseInt(log.reference_log_id, 10))
+      .filter(id => Number.isFinite(id) && id > 0))];
+
+    if (referenceLogIds.length > 0) {
+      const placeholders = referenceLogIds.map(() => '?').join(', ');
+      const [sourceRows] = await db.query(
+        `SELECT
+           src.log_id AS source_log_id,
+           src.transaction_group_id,
+           tg.permit_number,
+           tg.transaction_type,
+           tg.transaction_date,
+           tg.epoch
+         FROM logs src
+         LEFT JOIN transaction_groups tg ON src.transaction_group_id = tg.transaction_group_id
+         WHERE src.log_id IN (${placeholders})`,
+        referenceLogIds
+      );
+
+      for (const row of sourceRows) {
+        const ref = {
+          source_log_id: row.source_log_id,
+          ...transactionRefLabel(row)
+        };
+        sourceInfoByLogId.set(parseInt(row.source_log_id, 10), ref);
+      }
+      sourceTransactions = uniqueRefs([...sourceInfoByLogId.values()]);
+    }
+
+    const sellLogRows = logs.filter(log => String(log.type || '').toLowerCase() === 'sell');
+    const sellLogIds = sellLogRows
+      .map(log => parseInt(log.log_id, 10))
+      .filter(id => Number.isFinite(id) && id > 0);
+
+    if (sellLogIds.length > 0) {
+      const placeholders = sellLogIds.map(() => '?').join(', ');
+      const [returnRows] = await db.query(
+        `SELECT
+           ret.log_id AS return_log_id,
+           ret.reference_log_id,
+           ret.transaction_group_id,
+           ret.amount_meters,
+           ret.amount_yards,
+           ret.roll_count,
+           tg.permit_number,
+           tg.transaction_type,
+           tg.transaction_date,
+           tg.epoch
+         FROM logs ret
+         LEFT JOIN transaction_groups tg ON ret.transaction_group_id = tg.transaction_group_id
+         WHERE ret.type = 'return'
+           AND ret.reference_log_id IN (${placeholders})
+         ORDER BY ret.epoch ASC, ret.log_id ASC`,
+        sellLogIds
+      );
+
+      const sourceLogMap = new Map(sellLogRows.map(log => [parseInt(log.log_id, 10), log]));
+      const groupedReturns = new Map();
+      const allReturnTransactionRefs = [];
+
+      for (const row of returnRows) {
+        const sourceLogId = parseInt(row.reference_log_id, 10);
+        if (!groupedReturns.has(sourceLogId)) groupedReturns.set(sourceLogId, []);
+        groupedReturns.get(sourceLogId).push(row);
+      }
+
+      for (const sourceLogId of sellLogIds) {
+        const source = sourceLogMap.get(sourceLogId);
+        const rows = groupedReturns.get(sourceLogId) || [];
+        const originalYards = parseFloat(source?.amount_yards) || 0;
+        const originalMeters = parseFloat(source?.amount_meters) || 0;
+        const originalRolls = parseInt(source?.roll_count, 10) || 0;
+        const returnedYards = rows.reduce((sum, row) => sum + (parseFloat(row.amount_yards) || 0), 0);
+        const returnedMeters = rows.reduce((sum, row) => sum + (parseFloat(row.amount_meters) || 0), 0);
+        const returnedRolls = rows.reduce((sum, row) => sum + (parseInt(row.roll_count, 10) || 0), 0);
+
+        const txMap = new Map();
+        for (const row of rows) {
+          const groupId = row.transaction_group_id;
+          if (!groupId) continue;
+          if (!txMap.has(groupId)) {
+            txMap.set(groupId, {
+              ...transactionRefLabel(row),
+              returned_yards: 0,
+              returned_meters: 0,
+              returned_rolls: 0
+            });
+          }
+          const tx = txMap.get(groupId);
+          tx.returned_yards += parseFloat(row.amount_yards) || 0;
+          tx.returned_meters += parseFloat(row.amount_meters) || 0;
+          tx.returned_rolls += parseInt(row.roll_count, 10) || 0;
+        }
+
+        const transactions = [...txMap.values()].map(tx => ({
+          ...tx,
+          returned_yards: Math.round(tx.returned_yards * 100) / 100,
+          returned_meters: Math.round(tx.returned_meters * 100) / 100,
+          returned_rolls: tx.returned_rolls
+        }));
+        allReturnTransactionRefs.push(...transactions);
+
+        const hasReturns = returnedYards > 0.005 || returnedMeters > 0.005 || returnedRolls > 0;
+        const lengthFull = originalYards > 0
+          ? returnedYards >= originalYards - 0.005
+          : originalMeters > 0
+            ? returnedMeters >= originalMeters - 0.005
+            : true;
+        const rollsFull = originalRolls > 0 ? returnedRolls >= originalRolls : true;
+        const status = !hasReturns ? 'none' : (lengthFull && rollsFull ? 'full' : 'partial');
+
+        returnInfoBySellLogId.set(sourceLogId, {
+          status,
+          returned_yards: Math.round(returnedYards * 100) / 100,
+          returned_meters: Math.round(returnedMeters * 100) / 100,
+          returned_rolls: returnedRolls,
+          returnable_yards: Math.max(0, Math.round((originalYards - returnedYards) * 100) / 100),
+          returnable_meters: Math.max(0, Math.round((originalMeters - returnedMeters) * 100) / 100),
+          returnable_rolls: Math.max(0, originalRolls - returnedRolls),
+          original_yards: Math.round(originalYards * 100) / 100,
+          original_meters: Math.round(originalMeters * 100) / 100,
+          original_rolls: originalRolls,
+          transactions
+        });
+      }
+
+      returnTransactions = uniqueRefs(allReturnTransactionRefs);
+    }
+
     // Format logs
     const formattedLogs = logs.map(log => {
       const ak = log.amount_kilograms != null ? parseFloat(log.amount_kilograms) : null;
       const isKgTx = ak != null && !Number.isNaN(ak) && ak > 0;
       const am = isKgTx ? 0 : (log.amount_meters ? parseFloat(log.amount_meters) : 0);
       const ay = isKgTx ? 0 : (log.amount_yards ? parseFloat(log.amount_yards) : (am ? am * 1.0936 : 0));
+      const logType = String(log.type || '').toLowerCase();
+      const sourceInfo = log.reference_log_id ? sourceInfoByLogId.get(parseInt(log.reference_log_id, 10)) || null : null;
+      const returnInfo = logType === 'sell'
+        ? returnInfoBySellLogId.get(parseInt(log.log_id, 10)) || {
+            status: 'none',
+            returned_yards: 0,
+            returned_meters: 0,
+            returned_rolls: 0,
+            returnable_yards: Math.max(0, Math.round(ay * 100) / 100),
+            returnable_meters: Math.max(0, Math.round(am * 100) / 100),
+            returnable_rolls: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count, 10) || 0 : 0,
+            original_yards: Math.round(ay * 100) / 100,
+            original_meters: Math.round(am * 100) / 100,
+            original_rolls: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count, 10) || 0 : 0,
+            transactions: []
+          }
+        : null;
       return {
         log_id: log.log_id,
         type: log.type,
@@ -5963,6 +6136,8 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
         timezone: log.timezone,
         reference_log_id: log.reference_log_id || null,
         transaction_group_id: log.transaction_group_id || null,
+        source_info: sourceInfo,
+        return_info: returnInfo,
         created_at: log.created_at,
         updated_at: log.updated_at,
         // compatibility aliases
@@ -5980,7 +6155,9 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
         tz: log.timezone,
         isTrimmable: Boolean(log.is_trimmable),
         referenceLogId: log.reference_log_id || null,
-        transactionGroupId: log.transaction_group_id || null
+        transactionGroupId: log.transaction_group_id || null,
+        sourceInfo,
+        returnInfo
       };
     });
 
@@ -6002,6 +6179,10 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
       created_at: group.created_at,
       updated_at: group.updated_at,
       edited_at: group.edited_at || null,
+      source_transactions: sourceTransactions,
+      return_transactions: returnTransactions,
+      sourceTransactions,
+      returnTransactions,
       items: formattedLogs
     });
   } catch (error) {
