@@ -2566,7 +2566,7 @@ app.put('/api/fabrics', authMiddleware, requireRole('admin'), async (req, res) =
 // ============================================
 
 // POST /api/fabrics/:fabric_id/colors - Add color to fabric
-app.post('/api/fabrics/:fabric_id/colors', authMiddleware, requireRole('admin', 'ceo'), async (req, res) => {
+app.post('/api/fabrics/:fabric_id/colors', authMiddleware, requireMinRole('manager'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const fabricId = parseInt(req.params.fabric_id);

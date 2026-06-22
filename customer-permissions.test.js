@@ -13,3 +13,13 @@ describe('customer route permissions', () => {
     );
   });
 });
+
+describe('inventory route permissions', () => {
+  it('allows managers to create colors', () => {
+    assert.match(
+      serverSource,
+      /app\.post\('\/api\/fabrics\/:fabric_id\/colors',\s*authMiddleware,\s*(?:requireMinRole\('manager'\)|requireRole\([^)]*'manager'[^)]*\))/s,
+      'POST /api/fabrics/:fabric_id/colors must allow manager or higher so managers can add colors from inventory'
+    );
+  });
+});
