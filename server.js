@@ -960,6 +960,221 @@ function dateStringToEpochBeirut(dateStr) {
   return noonUtc - (hour * 3600 + minute * 60 + second) * 1000;
 }
 
+function parseAuditDateFilter(value, boundary) {
+  if (!value) return null;
+  const raw = String(value).trim();
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    const startEpoch = dateStringToEpochBeirut(raw);
+    if (!Number.isFinite(startEpoch)) return null;
+    const epoch = boundary === 'end' ? startEpoch + 86400000 : startEpoch;
+    return {
+      operator: boundary === 'end' ? '<' : '>=',
+      value: new Date(epoch).toISOString()
+    };
+  }
+
+  if (/^\d+$/.test(raw)) {
+    const epoch = Number(raw);
+    if (!Number.isFinite(epoch)) return null;
+    return {
+      operator: boundary === 'end' ? '<=' : '>=',
+      value: new Date(epoch).toISOString()
+    };
+  }
+
+  return null;
+}
+
+function auditSearchTokens(q) {
+  return String(q || '')
+    .trim()
+    .slice(0, 160)
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 8)
+    .map(token => token.slice(0, 32).toLowerCase());
+}
+
+function auditSearchExpression() {
+  const fields = [
+    'a.audit_id',
+    'a.table_name',
+    'a.record_id',
+    'a.action',
+    'a.username',
+    'u.username',
+    'u.full_name',
+    'u.email',
+    'a.field_name',
+    'a.old_value',
+    'a.new_value',
+    'CAST(a.changes AS CHAR)',
+    'a.notes',
+    'a.ip_address',
+    'target_user.username',
+    'target_user.full_name',
+    'target_user.email',
+    'target_user.role',
+    'direct_fabric.fabric_name',
+    'direct_fabric.main_code',
+    'direct_fabric.source',
+    'direct_fabric.design',
+    'direct_color.color_name',
+    'direct_color.lot',
+    'direct_color.roll_nb',
+    'direct_color.weight',
+    'direct_color.status',
+    'direct_color_fabric.fabric_name',
+    'direct_color_fabric.main_code',
+    'direct_color_fabric.source',
+    'direct_color_fabric.design',
+    'direct_lot.lot_number',
+    'direct_lot.weight',
+    'direct_lot.roll_nb',
+    'direct_lot_color.color_name',
+    'direct_lot_fabric.fabric_name',
+    'direct_lot_fabric.main_code',
+    'direct_lot_fabric.source',
+    'direct_lot_fabric.design',
+    'direct_customer.customer_name',
+    'direct_customer.phone',
+    'direct_customer.email',
+    'direct_customer.notes',
+    'direct_salesperson.name',
+    'direct_salesperson.code',
+    'direct_salesperson.email',
+    'direct_salesperson.phone',
+    'linked_log.type',
+    'linked_log.fabric_name',
+    'linked_log.color_name',
+    'linked_log.customer_name',
+    'linked_log.weight',
+    'linked_log.lot',
+    'linked_log.roll_nb',
+    'linked_log.notes',
+    'linked_log.transaction_group_id',
+    'linked_log_fabric.fabric_name',
+    'linked_log_fabric.main_code',
+    'linked_log_fabric.source',
+    'linked_log_fabric.design',
+    'linked_log_color.color_name',
+    'linked_group.permit_number',
+    'linked_group.transaction_type',
+    'linked_group.customer_name',
+    'linked_group.notes',
+    'direct_group.transaction_group_id',
+    'direct_group.permit_number',
+    'direct_group.transaction_type',
+    'direct_group.customer_name',
+    'direct_group.notes'
+  ];
+
+  const normalizedFields = fields.map(field => `CAST(${field} AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci`);
+  return `LOWER(CONCAT_WS(' ', ${normalizedFields.join(', ')}))`;
+}
+
+function auditContextJoins(includeContext = false) {
+  if (!includeContext) return '';
+  return `
+    LEFT JOIN users target_user ON a.table_name = 'users' AND a.record_id = target_user.user_id
+    LEFT JOIN fabrics direct_fabric ON a.table_name = 'fabrics' AND a.record_id = direct_fabric.fabric_id
+    LEFT JOIN colors direct_color ON a.table_name = 'colors' AND a.record_id = direct_color.color_id
+    LEFT JOIN fabrics direct_color_fabric ON direct_color.fabric_id = direct_color_fabric.fabric_id
+    LEFT JOIN color_lots direct_lot ON a.table_name = 'color_lots' AND a.record_id = direct_lot.lot_id
+    LEFT JOIN colors direct_lot_color ON direct_lot.color_id = direct_lot_color.color_id
+    LEFT JOIN fabrics direct_lot_fabric ON direct_lot_color.fabric_id = direct_lot_fabric.fabric_id
+    LEFT JOIN customers direct_customer ON a.table_name = 'customers' AND a.record_id = direct_customer.customer_id
+    LEFT JOIN salespersons direct_salesperson ON a.table_name = 'salespersons' AND a.record_id = direct_salesperson.salesperson_id
+    LEFT JOIN logs linked_log ON a.table_name = 'logs' AND a.record_id = linked_log.log_id
+    LEFT JOIN fabrics linked_log_fabric ON linked_log.fabric_id = linked_log_fabric.fabric_id
+    LEFT JOIN colors linked_log_color ON linked_log.color_id = linked_log_color.color_id
+    LEFT JOIN transaction_groups linked_group ON linked_log.transaction_group_id = linked_group.transaction_group_id
+    LEFT JOIN transaction_groups direct_group ON a.table_name = 'transaction_groups' AND CAST(a.record_id AS CHAR) = direct_group.transaction_group_id
+  `;
+}
+
+function buildAuditLogFilters({ table_name, record_id, action, user_id, start_date, end_date, q }) {
+  const clauses = [];
+  const params = [];
+  const errors = [];
+
+  if (table_name) {
+    clauses.push('a.table_name = ?');
+    params.push(String(table_name).trim());
+  }
+
+  if (record_id) {
+    const id = Number.parseInt(record_id, 10);
+    if (Number.isFinite(id)) {
+      clauses.push('a.record_id = ?');
+      params.push(id);
+    } else {
+      errors.push('Invalid record_id');
+    }
+  }
+
+  if (action) {
+    const normalizedAction = String(action).trim().toUpperCase();
+    if (['INSERT', 'UPDATE', 'DELETE'].includes(normalizedAction)) {
+      clauses.push('a.action = ?');
+      params.push(normalizedAction);
+    } else {
+      errors.push('Invalid action');
+    }
+  }
+
+  if (user_id) {
+    const id = Number.parseInt(user_id, 10);
+    if (Number.isFinite(id)) {
+      clauses.push('a.user_id = ?');
+      params.push(id);
+    } else {
+      errors.push('Invalid user_id');
+    }
+  }
+
+  if (start_date) {
+    const start = parseAuditDateFilter(start_date, 'start');
+    if (start) {
+      clauses.push(`a.created_at ${start.operator} ?`);
+      params.push(start.value);
+    } else {
+      errors.push('Invalid start_date');
+    }
+  }
+
+  if (end_date) {
+    const end = parseAuditDateFilter(end_date, 'end');
+    if (end) {
+      clauses.push(`a.created_at ${end.operator} ?`);
+      params.push(end.value);
+    } else {
+      errors.push('Invalid end_date');
+    }
+  }
+
+  const tokens = auditSearchTokens(q);
+  if (tokens.length > 0) {
+    const searchExpr = auditSearchExpression();
+    for (const token of tokens) {
+      const variants = new Set([token]);
+      if (/^\d+$/.test(token)) variants.add(token.replace(/^0+/, '') || '0');
+      clauses.push(`(${Array.from(variants).map(() => `${searchExpr} LIKE ?`).join(' OR ')})`);
+      for (const variant of variants) {
+        params.push(`%${variant}%`);
+      }
+    }
+  }
+
+  return {
+    sql: clauses.length ? ` AND ${clauses.join(' AND ')}` : '',
+    params,
+    errors,
+    hasSearch: tokens.length > 0
+  };
+}
+
 // Generate permit number automatically based on transaction type
 // Separate counters for Type A, Type B, and Return, auto-incrementing from last transaction
 async function generatePermitNumber(connection, transactionType, sourceType = null) {
@@ -8918,9 +9133,15 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
       user_id,
       start_date,
       end_date,
+      q,
       limit = 100,
       offset = 0
     } = req.query;
+
+    const filters = buildAuditLogFilters({ table_name, record_id, action, user_id, start_date, end_date, q });
+    if (filters.errors.length > 0) {
+      return res.status(400).json({ error: filters.errors.join(', ') });
+    }
 
     let query = `
       SELECT 
@@ -8929,56 +9150,29 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
         u.email as user_email
       FROM audit_logs a
       LEFT JOIN users u ON a.user_id = u.user_id
+      ${auditContextJoins(filters.hasSearch)}
       WHERE 1=1
     `;
-    const params = [];
+    const params = [...filters.params];
 
-    if (table_name) {
-      query += ' AND a.table_name = ?';
-      params.push(table_name);
-    }
-
-    if (record_id) {
-      query += ' AND a.record_id = ?';
-      params.push(parseInt(record_id));
-    }
-
-    if (action) {
-      query += ' AND a.action = ?';
-      params.push(action);
-    }
-
-    if (user_id) {
-      query += ' AND a.user_id = ?';
-      params.push(parseInt(user_id));
-    }
-
-    if (start_date) {
-      query += ' AND a.created_at >= ?';
-      params.push(new Date(parseInt(start_date)).toISOString());
-    }
-
-    if (end_date) {
-      query += ' AND a.created_at <= ?';
-      params.push(new Date(parseInt(end_date)).toISOString());
-    }
-
+    query += filters.sql;
     query += ' ORDER BY a.created_at DESC LIMIT ? OFFSET ?';
-    const limitInt = parseInt(limit) || 100;
-    const offsetInt = parseInt(offset) || 0;
+    const limitInt = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 250);
+    const offsetInt = Math.max(parseInt(offset, 10) || 0, 0);
     params.push(limitInt, offsetInt);
 
     const [logs] = await db.query(query, params);
 
     // Get total count for pagination
-    let countQuery = 'SELECT COUNT(*) as total FROM audit_logs WHERE 1=1';
-    const countParams = [];
-    if (table_name) { countQuery += ' AND table_name = ?'; countParams.push(table_name); }
-    if (record_id) { countQuery += ' AND record_id = ?'; countParams.push(parseInt(record_id)); }
-    if (action) { countQuery += ' AND action = ?'; countParams.push(action); }
-    if (user_id) { countQuery += ' AND user_id = ?'; countParams.push(parseInt(user_id)); }
-    if (start_date) { countQuery += ' AND created_at >= ?'; countParams.push(new Date(parseInt(start_date)).toISOString()); }
-    if (end_date) { countQuery += ' AND created_at <= ?'; countParams.push(new Date(parseInt(end_date)).toISOString()); }
+    const countQuery = `
+      SELECT COUNT(DISTINCT a.audit_id) as total
+      FROM audit_logs a
+      LEFT JOIN users u ON a.user_id = u.user_id
+      ${auditContextJoins(filters.hasSearch)}
+      WHERE 1=1
+      ${filters.sql}
+    `;
+    const countParams = [...filters.params];
 
     const [countResult] = await db.query(countQuery, countParams);
     const total = countResult[0]?.total || 0;
@@ -9137,17 +9331,22 @@ app.get('/api/audit-logs/statistics', authMiddleware, requireRole('admin'), asyn
     }
 
     const { start_date, end_date } = req.query;
-    let dateFilter = '';
-    const params = [];
+    const dateBounds = [];
 
     if (start_date) {
-      dateFilter += ' AND created_at >= ?';
-      params.push(new Date(parseInt(start_date)).toISOString());
+      const start = parseAuditDateFilter(start_date, 'start');
+      if (!start) return res.status(400).json({ error: 'Invalid start_date' });
+      dateBounds.push(start);
     }
     if (end_date) {
-      dateFilter += ' AND created_at <= ?';
-      params.push(new Date(parseInt(end_date)).toISOString());
+      const end = parseAuditDateFilter(end_date, 'end');
+      if (!end) return res.status(400).json({ error: 'Invalid end_date' });
+      dateBounds.push(end);
     }
+
+    const params = dateBounds.map(bound => bound.value);
+    const dateFilter = dateBounds.map(bound => ` AND created_at ${bound.operator} ?`).join('');
+    const aliasedDateFilter = dateBounds.map(bound => ` AND a.created_at ${bound.operator} ?`).join('');
 
     // Most active users
     const [activeUsers] = await db.query(`
@@ -9158,7 +9357,7 @@ app.get('/api/audit-logs/statistics', authMiddleware, requireRole('admin'), asyn
         COUNT(*) as action_count
       FROM audit_logs a
       LEFT JOIN users u ON a.user_id = u.user_id
-      WHERE 1=1 ${dateFilter}
+      WHERE 1=1 ${aliasedDateFilter}
       GROUP BY a.user_id, u.username, u.full_name
       ORDER BY action_count DESC
       LIMIT 10
@@ -9195,7 +9394,7 @@ app.get('/api/audit-logs/statistics', authMiddleware, requireRole('admin'), asyn
         DATE(created_at) as date,
         COUNT(*) as action_count
       FROM audit_logs
-      WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) ${dateFilter ? 'AND' + dateFilter.replace('AND', '') : ''}
+      WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) ${dateFilter}
       GROUP BY DATE(created_at)
       ORDER BY date DESC
     `, params);
